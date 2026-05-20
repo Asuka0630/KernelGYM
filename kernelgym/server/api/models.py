@@ -62,6 +62,12 @@ class EvaluationRequest(BaseModel):
         default=None,
         description="Run performance timing step (overrides measure_performance)",
     )
+    skip_reference: bool = Field(
+        default=False,
+        description="If True, skip the reference timing task entirely. "
+                    "Returned reference_runtime/speedup will be -1/0; useful for "
+                    "benchmarking the kernel-evaluation path itself.",
+    )
     cases_code: Optional[str] = Field(
         default=None,
         description="Python code defining get_cases()/get_inputs() for kernel_simple workflow",
