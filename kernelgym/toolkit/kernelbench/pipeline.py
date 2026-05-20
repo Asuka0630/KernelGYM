@@ -74,13 +74,18 @@ def _record_memory_peak(
     ``metadata['memory_peak']``. No-op on CUDA failure.
     """
     try:
+        torch.cuda.synchronize(device=device)
+    except Exception:
+        pass
+    try:
         allocated = int(torch.cuda.max_memory_allocated(device=device))
         reserved = int(torch.cuda.max_memory_reserved(device=device))
     except Exception:
         return
 
     def _merge_into(target: Dict[str, Any]) -> None:
-        bucket = target.get("memory_peak")
+        # we only record max used bytes here, client should translate to other units
+        bucket: Dict[str, Any] = target.get("memory_peak") or {}
         if not isinstance(bucket, dict):
             bucket = {"allocated_bytes": 0, "reserved_bytes": 0}
         bucket["allocated_bytes"] = max(int(bucket.get("allocated_bytes", 0)), allocated)
