@@ -16,6 +16,7 @@ class EvaluationTask:
     backend: str = "triton"
     num_correct_trials: int = 5
     num_perf_trials: int = 100
+    num_warmup: int = 3
     timeout: int = 300
     device: str = "cuda:0"
     priority: str = "normal"
@@ -32,6 +33,7 @@ class EvaluationTask:
     run_correctness: Optional[bool] = None
     run_triton_detection: Optional[bool] = None
     run_performance: Optional[bool] = None
+    skip_reference: bool = False
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -53,6 +55,7 @@ class ReferenceTimingTask:
     backend_adapter: str = "kernelbench"
     backend: str = "triton"
     num_perf_trials: int = 100
+    num_warmup: int = 3
     timeout: int = 300
     device: str = "cuda:0"
     priority: str = "normal"
@@ -82,6 +85,7 @@ class KernelEvaluationTask:
     backend: str = "triton"
     num_correct_trials: int = 5
     num_perf_trials: int = 100
+    num_warmup: int = 3
     timeout: int = 300
     device: str = "cuda:0"
     priority: str = "normal"

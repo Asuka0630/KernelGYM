@@ -1,7 +1,9 @@
+# KernelBench/src/kernelbench/eval.py
 """KernelBench correctness helpers (toolkit layer)."""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -12,6 +14,23 @@ from kernelgym.toolkit.kernelbench.exec_types import (
     get_error_name,
     set_seed,
 )
+
+
+def _record_phase_ms(metadata: dict, phase: str, elapsed_sec: float) -> None:
+    """Append/aggregate ``phase`` wall-time (ms) to
+    ``metadata['phase_timings_ms']``. No-op when metadata is None.
+    """
+    if metadata is None:
+        return
+    bucket = metadata.setdefault("phase_timings_ms", {})
+    elapsed_ms = float(elapsed_sec) * 1000.0
+    if phase in bucket:
+        try:
+            bucket[phase] = float(bucket[phase]) + elapsed_ms
+        except (TypeError, ValueError):
+            bucket[phase] = elapsed_ms
+    else:
+        bucket[phase] = elapsed_ms
 
 
 def register_and_format_exception(
@@ -52,28 +71,36 @@ def run_and_check_correctness(
             if verbose:
                 print(f"[Eval] Generating Random Input with seed {trial_seed}")
 
+            _t = time.perf_counter()
             set_seed(trial_seed)
             inputs = get_inputs_fn()
             inputs = [
                 x.cuda(device=device) if isinstance(x, torch.Tensor) else x
                 for x in inputs
             ]
+            _record_phase_ms(metadata, "correctness.input_setup", time.perf_counter() - _t)
 
+            _t = time.perf_counter()
             set_seed(trial_seed)
             model = original_model_instance.cuda(device=device)
 
             set_seed(trial_seed)
             model_new = new_model_instance.cuda(device=device)
+            _record_phase_ms(metadata, "correctness.model_to_device", time.perf_counter() - _t)
 
             print(f"device: {device}")
             print(f"inputs: {inputs[0].device}")
 
+            _t = time.perf_counter()
             output = model(*inputs)
             torch.cuda.synchronize(device=device)
+            _record_phase_ms(metadata, "correctness.ref_forward", time.perf_counter() - _t)
 
             try:
+                _t = time.perf_counter()
                 output_new = model_new(*inputs)
                 torch.cuda.synchronize(device=device)
+                _record_phase_ms(metadata, "correctness.new_forward", time.perf_counter() - _t)
                 if output.shape != output_new.shape:
                     metadata = register_and_format_exception(
                         "correctness_issue",
@@ -89,11 +116,18 @@ def run_and_check_correctness(
                         compiled=True, correctness=False, metadata=metadata
                     )
 
-                if not torch.allclose(output, output_new, atol=1e-02, rtol=1e-02):
-                    max_diff = torch.max(torch.abs(output - output_new)).item()
-                    avg_diff = torch.mean(torch.abs(output - output_new)).item()
+                _t = time.perf_counter()
+                # Memory-efficient replacement for `torch.allclose`.
+                diff = (output - output_new).abs_()
+                max_diff = diff.max().item()
+                del diff
+                atol, rtol = 1e-02, 1e-02 # FP16/BF16
+                max_abs_b = output_new.abs().max().item()
+                is_close = max_diff <= atol + rtol * max_abs_b
+                _record_phase_ms(metadata, "correctness.compare", time.perf_counter() - _t)
+
+                if not is_close:
                     metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
-                    metadata.setdefault("avg_difference", []).append(f"{avg_diff:.6f}")
                     metadata["correctness_issue"] = "Output mismatch"
                     if verbose:
                         print(f"[FAIL] trial {trial}: Output mismatch")
