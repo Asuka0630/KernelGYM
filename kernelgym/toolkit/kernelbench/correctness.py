@@ -41,11 +41,105 @@ def register_and_format_exception(
     truncate: bool = False,
     max_length: int = 200,
 ):
-    if verbose:
-        print(f"[Exception {exception_type}] {str(exception_msg)} ")
+    """Record an exception into ``metadata`` as a *string*"""
 
-    metadata[exception_type] = exception_msg
+    msg = str(exception_msg)
+    if truncate and len(msg) > max_length:
+        msg = msg[:max_length] + "..."
+
+    if verbose:
+        print(f"[Exception {exception_type}] {msg} ")
+
+    metadata[exception_type] = msg
     return metadata
+
+
+class _ShapeMismatch(Exception):
+    """Internal signal: ref/new output shape differs (not a runtime error)."""
+
+    def __init__(self, ref_shape, new_shape):
+        super().__init__(
+            f"Output shape mismatch: Expected {ref_shape}, got {new_shape}"
+        )
+        self.ref_shape = ref_shape
+        self.new_shape = new_shape
+
+
+def _run_single_correctness_trial(
+    original_model_instance: nn.Module,
+    new_model_instance: nn.Module,
+    get_inputs_fn: callable,
+    metadata: dict,
+    trial_seed: int,
+    device: Any,
+    verbose: bool,
+) -> tuple[bool, float | None]:
+    """Run one correctness trial."""
+    # Pre-bind names so the ``finally`` block below can ``del`` them unconditionally.
+    inputs = None
+    model = None
+    model_new = None
+    output = None
+    output_new = None
+    try:
+        _t = time.perf_counter()
+        set_seed(trial_seed)
+        inputs = get_inputs_fn()
+        inputs = [
+            x.cuda(device=device) if isinstance(x, torch.Tensor) else x for x in inputs
+        ]
+        _record_phase_ms(metadata, "correctness.input_setup", time.perf_counter() - _t)
+
+        _t = time.perf_counter()
+        set_seed(trial_seed)
+        model = original_model_instance.cuda(device=device)
+        set_seed(trial_seed)
+        model_new = new_model_instance.cuda(device=device)
+        _record_phase_ms(
+            metadata, "correctness.model_to_device", time.perf_counter() - _t
+        )
+
+        if verbose:
+            print(f"device: {device}")
+            if inputs and isinstance(inputs[0], torch.Tensor):
+                print(f"inputs: {inputs[0].device}")
+
+        _t = time.perf_counter()
+        output = model(*inputs)
+        torch.cuda.synchronize(device=device)
+        _record_phase_ms(metadata, "correctness.ref_forward", time.perf_counter() - _t)
+
+        _t = time.perf_counter()
+        output_new = model_new(*inputs)
+        torch.cuda.synchronize(device=device)
+        _record_phase_ms(metadata, "correctness.new_forward", time.perf_counter() - _t)
+
+        # Free inputs and modules as early as possible; only the two outputs
+        # are needed for the comparison below.
+        del inputs
+        inputs = None
+        del model
+        model = None
+        del model_new
+        model_new = None
+
+        if output.shape != output_new.shape:
+            raise _ShapeMismatch(output.shape, output_new.shape)
+
+        _t = time.perf_counter()
+        # Memory-efficient replacement for ``torch.allclose``.
+        atol, rtol = 1e-02, 1e-02  # FP16/BF16
+        output.sub_(output_new).abs_()  # output := |output - output_new|
+        max_diff = output.max().item()
+        max_abs_b = output_new.abs_().max().item()
+        is_close = max_diff <= atol + rtol * max_abs_b
+        _record_phase_ms(metadata, "correctness.compare", time.perf_counter() - _t)
+
+        return is_close, max_diff
+    finally:
+        # Drop local references to any GPU-resident objects on every exit
+        # path (success / mismatch / runtime error).
+        del inputs, model, model_new, output, output_new
 
 
 def run_and_check_correctness(
@@ -71,89 +165,68 @@ def run_and_check_correctness(
             if verbose:
                 print(f"[Eval] Generating Random Input with seed {trial_seed}")
 
-            _t = time.perf_counter()
-            set_seed(trial_seed)
-            inputs = get_inputs_fn()
-            inputs = [
-                x.cuda(device=device) if isinstance(x, torch.Tensor) else x
-                for x in inputs
-            ]
-            _record_phase_ms(metadata, "correctness.input_setup", time.perf_counter() - _t)
-
-            _t = time.perf_counter()
-            set_seed(trial_seed)
-            model = original_model_instance.cuda(device=device)
-
-            set_seed(trial_seed)
-            model_new = new_model_instance.cuda(device=device)
-            _record_phase_ms(metadata, "correctness.model_to_device", time.perf_counter() - _t)
-
-            print(f"device: {device}")
-            print(f"inputs: {inputs[0].device}")
-
-            _t = time.perf_counter()
-            output = model(*inputs)
-            torch.cuda.synchronize(device=device)
-            _record_phase_ms(metadata, "correctness.ref_forward", time.perf_counter() - _t)
-
             try:
-                _t = time.perf_counter()
-                output_new = model_new(*inputs)
-                torch.cuda.synchronize(device=device)
-                _record_phase_ms(metadata, "correctness.new_forward", time.perf_counter() - _t)
-                if output.shape != output_new.shape:
-                    metadata = register_and_format_exception(
-                        "correctness_issue",
-                        f"Output shape mismatch: Expected {output.shape}, got {output_new.shape}",
-                        metadata,
-                    )
-                    metadata["correctness_issue_name"] = "correctness_issue"
-                    if verbose:
-                        print(
-                            f"[FAIL] trial {trial}: Output shape mismatch: Expected {output.shape}, got {output_new.shape}"
-                        )
-                    return KernelExecResult(
-                        compiled=True, correctness=False, metadata=metadata
-                    )
-
-                _t = time.perf_counter()
-                # Memory-efficient replacement for `torch.allclose`.
-                diff = (output - output_new).abs_()
-                max_diff = diff.max().item()
-                del diff
-                atol, rtol = 1e-02, 1e-02 # FP16/BF16
-                max_abs_b = output_new.abs().max().item()
-                is_close = max_diff <= atol + rtol * max_abs_b
-                _record_phase_ms(metadata, "correctness.compare", time.perf_counter() - _t)
-
-                if not is_close:
-                    metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
-                    metadata["correctness_issue"] = "Output mismatch"
-                    if verbose:
-                        print(f"[FAIL] trial {trial}: Output mismatch")
-                else:
-                    pass_count += 1
-                    if verbose:
-                        print(f"[PASS] trial {trial}: New Model matches Model")
-
-            except Exception as e:
-                print("[Error] Exception happens during correctness check")
-                print(f"Error in launching kernel for ModelNew: {e}")
-
-                metadata = register_and_format_exception(
-                    "runtime_error", e, metadata, truncate=False
+                is_close, max_diff = _run_single_correctness_trial(
+                    original_model_instance=original_model_instance,
+                    new_model_instance=new_model_instance,
+                    get_inputs_fn=get_inputs_fn,
+                    metadata=metadata,
+                    trial_seed=trial_seed,
+                    device=device,
+                    verbose=verbose,
                 )
-                metadata["runtime_error_name"] = get_error_name(e)
+            except _ShapeMismatch as e:
+                err_msg = str(e)
+                metadata = register_and_format_exception(
+                    "correctness_issue", err_msg, metadata
+                )
+                metadata["correctness_issue_name"] = "correctness_issue"
+                metadata["correctness_trials"] = (
+                    f"({pass_count} / {num_correct_trials})"
+                )
+                if verbose:
+                    print(f"[FAIL] check_correctness trial {trial}: {err_msg}")
+                return KernelExecResult(
+                    compiled=True, correctness=False, metadata=metadata
+                )
+            except Exception as e:
+                err_msg = str(e)
+                err_name = get_error_name(e)
+                print("[Error] Exception happens during correctness check")
+                print(f"Error in launching kernel for ModelNew: {err_msg}")
+                metadata = register_and_format_exception(
+                    "runtime_error", err_msg, metadata, truncate=False
+                )
+                metadata["runtime_error_name"] = err_name
+                metadata["correctness_trials"] = (
+                    f"({pass_count} / {num_correct_trials})"
+                )
+                if verbose:
+                    print(f"[FAIL] check_correctness trial {trial}: {err_msg}")
                 return KernelExecResult(
                     compiled=True, correctness=False, metadata=metadata
                 )
 
+            metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
+            if is_close:
+                pass_count += 1
+                continue
+            metadata["correctness_issue"] = "Output mismatch"
+            metadata["correctness_issue_name"] = "correctness_issue"
+            if verbose:
+                print(f"[FAIL] check_correctness trial {trial}: Output mismatch ")
+
     if verbose:
-        print(
-            f"[Eval] Pass count: {pass_count}, num_correct_trials: {num_correct_trials}"
-        )
+        print(f"[Eval] check_correctness pass: {pass_count}/{num_correct_trials}")
 
     metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
+
+    # Fold the per-trial max_difference list into ``correctness_issue``
+    diffs = metadata.pop("max_difference", None)
+    if diffs and "correctness_issue" in metadata:
+        metadata["correctness_issue"] = (
+            f"{metadata['correctness_issue']}; max_difference=[{', '.join(diffs)}]"
+        )
 
     if pass_count == num_correct_trials:
         return KernelExecResult(compiled=True, correctness=True, metadata=metadata)
