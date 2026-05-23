@@ -163,9 +163,9 @@ API_HOST="${API_HOST:-$(get_ip_address)}"
 AVAILABLE_PORTS="$(get_available_ports)"
 SELECTED_PORTS="$(select_ports "${AVAILABLE_PORTS}")"
 
-REDIS_PORT="$(echo "${SELECTED_PORTS}" | awk '{print $1}')"
-API_PORT="$(echo "${SELECTED_PORTS}" | awk '{print $2}')"
-METRICS_PORT="$(echo "${SELECTED_PORTS}" | awk '{print $3}')"
+REDIS_PORT="${REDIS_PORT:-$(echo "${SELECTED_PORTS}" | awk '{print $1}')}"
+API_PORT="${API_PORT:-$(echo "${SELECTED_PORTS}" | awk '{print $2}')}"
+METRICS_PORT="${METRICS_PORT:-$(echo "${SELECTED_PORTS}" | awk '{print $3}')}"
 GPU_DEVICES="${GPU_DEVICES:-$(detect_gpus_json)}"
 
 REDIS_HOST="${REDIS_HOST:-localhost}"
