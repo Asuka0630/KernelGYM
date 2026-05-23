@@ -153,16 +153,23 @@ class KernelBenchBackendBase(Backend):
         device = handle.get("device")
         context = handle.get("context", {})
         tempfile_handle = handle.get("tempfile_handle")
+        build_dir = handle.get("build_dir")
 
         if isinstance(device, torch.device) and device.type == "cuda":
             try:
                 graceful_eval_cleanup(context, device, tempfile_handle)
-                return
             except Exception:
                 pass
 
         if tempfile_handle is not None:
             try:
                 tempfile_handle.close()
+            except Exception:
+                pass
+
+        if build_dir:
+            import shutil
+            try:
+                shutil.rmtree(build_dir, ignore_errors=True)
             except Exception:
                 pass
