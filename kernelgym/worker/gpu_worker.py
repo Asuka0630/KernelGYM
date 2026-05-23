@@ -413,14 +413,12 @@ class GPUWorker:
         _dispatch_elapsed = _time.perf_counter() - _dispatch_start
 
         # Annotate the result with how long this worker layer spent dispatching
-        # the task (await + thread-pool + subprocess IPC). The toolkit pipeline
-        # already publishes its own ``total`` phase; subtracting that from
-        # ``worker.dispatch`` gives the pure worker overhead.
+        # the task (await + thread-pool + subprocess IPC). 
         try:
             md = result_dict.get("metadata") if isinstance(result_dict, dict) else None
             if isinstance(md, dict):
                 bucket = md.setdefault("phase_timings_ms", {})
-                bucket["worker.dispatch"] = float(_dispatch_elapsed) * 1000.0
+                bucket["worker_dispatch"] = float(_dispatch_elapsed) * 1000.0
         except Exception:
             pass
 

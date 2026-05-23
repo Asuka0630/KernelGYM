@@ -52,7 +52,7 @@ def time_execution_with_cuda_event(
     for _ in range(num_warmup):
         kernel_fn(*args)
         torch.cuda.synchronize(device=device)
-    _record_phase_ms(metadata, "performance.warmup", time.perf_counter() - _warmup_start)
+    _record_phase_ms(metadata, "performance.measure.warmup", time.perf_counter() - _warmup_start)
 
     print(
         f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
@@ -74,7 +74,7 @@ def time_execution_with_cuda_event(
         if verbose:
             print(f"Trial {trial + 1}: {elapsed_time_ms:.3g} ms")
         elapsed_times.append(elapsed_time_ms)
-    _record_phase_ms(metadata, "performance.timing_trials", time.perf_counter() - _trials_start)
+    _record_phase_ms(metadata, "performance.measure.timing_trials", time.perf_counter() - _trials_start)
 
     profiling_metrics: Dict[str, Any] = {}
     if enable_profiling:

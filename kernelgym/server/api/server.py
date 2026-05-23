@@ -366,7 +366,7 @@ async def _execute_workflow(
             md = result.get("metadata") if isinstance(result, dict) else None
             if isinstance(md, dict):
                 bucket = md.setdefault("phase_timings_ms", {})
-                bucket["server.scheduler"] = float(_server_elapsed) * 1000.0
+                bucket["server_scheduler"] = float(_server_elapsed) * 1000.0
         except Exception:
             pass
     await task_mgr.complete_task(task_id, result)
