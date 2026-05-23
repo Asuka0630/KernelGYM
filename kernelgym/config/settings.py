@@ -177,10 +177,24 @@ class Settings(BaseSettings):
         return ["Hopper"]
 
     def setup_log_directory(self) -> None:
+        import re
+        from datetime import datetime
+
+        repo_root = PROJECT_ROOT.parent
+
         log_path = Path(self.log_dir)
         if not log_path.is_absolute():
-            log_path = PROJECT_ROOT / self.log_dir
+            log_path = repo_root / self.log_dir
+
+        timestamp_re = re.compile(r"^\d{8}-\d{6}$")
+        # reuse timestamp
+        if not timestamp_re.match(log_path.name):
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_path = log_path / timestamp
+
         os.makedirs(log_path, exist_ok=True)
+        self.log_dir = str(log_path)
+        self.eval_results_path = str(log_path / "eval_results.jsonl")
 
     def get_redis_url(self) -> str:
         if self.redis_password:
@@ -260,7 +274,7 @@ def get_logging_config() -> Dict[str, Any]:
 
     log_path = Path(settings.log_dir)
     if not log_path.is_absolute():
-        log_path = PROJECT_ROOT / settings.log_dir
+        log_path = PROJECT_ROOT.parent / settings.log_dir
 
     handlers = {
         "console": {
@@ -367,7 +381,7 @@ def setup_logging(component_name: str = "server"):
     if settings.log_to_file:
         log_path = Path(settings.log_dir)
         if not log_path.is_absolute():
-            log_path = PROJECT_ROOT / settings.log_dir
+            log_path = PROJECT_ROOT.parent / settings.log_dir
         logger.info(f"Log files will be written to: {log_path}")
 
     return logger

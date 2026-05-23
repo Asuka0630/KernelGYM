@@ -420,7 +420,7 @@ except Exception as e:
             ]
             
             # Ensure logs directory exists and append logs to the same pattern as manual start
-            logs_dir = Path("logs")
+            logs_dir = Path(settings.log_dir)
             logs_dir.mkdir(parents=True, exist_ok=True)
             log_file_path = logs_dir / f"{worker_id}.log"
             # Start worker as subprocess with stdout/stderr redirected to log file
