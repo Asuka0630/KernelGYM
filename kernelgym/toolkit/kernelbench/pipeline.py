@@ -541,14 +541,19 @@ def eval_kernel_against_ref(
     backend_handle = None
     backend_session = None
 
-    def _cleanup():
+    def _cleanup(*, cleanup_build_dir: str | None = None):
         if backend_session is not None:
             backend_session.close()
-            return
-        if backend_adapter is not None and backend_handle is not None:
+        elif backend_adapter is not None and backend_handle is not None:
             backend_adapter.cleanup(backend_handle)
-            return
-        graceful_eval_cleanup(context, device, tempfile_handle)
+        else:
+            graceful_eval_cleanup(context, device, tempfile_handle)
+        if cleanup_build_dir:
+            import shutil
+            try:
+                shutil.rmtree(cleanup_build_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     try:
         os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -563,16 +568,17 @@ def eval_kernel_against_ref(
                 )
                 if not artifact.get("compiled"):
                     error = artifact.get("error", "Unknown compile error")
+                    failed_build_dir = artifact.get("build_dir")
                     if "lock" in str(error) or "No such file or directory" in str(error):
                         print(
                             f"[Eval] Lock file error during compilation, Please retry. Error: {error}"
                         )
-                        _cleanup()
+                        _cleanup(cleanup_build_dir=failed_build_dir)
                         return None
                     metadata["compilation_error_name"] = "compile_error"
                     metadata["compilation_error"] = error
                     _record_memory_peak(metadata, device)
-                    _cleanup()
+                    _cleanup(cleanup_build_dir=failed_build_dir)
                     _record_phase(metadata, "load", time.perf_counter() - _load_phase_start)
                     _record_phase(metadata, "total", time.perf_counter() - _total_phase_start)
                     return KernelExecResult(compiled=False, metadata=metadata)
@@ -600,16 +606,23 @@ def eval_kernel_against_ref(
             f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
         )
 
+        # If compile() was reached, a build_dir may have been created; extract it safely.
+        _failed_build_dir = None
+        try:
+            _failed_build_dir = artifact.get("build_dir")
+        except (NameError, AttributeError):
+            pass
+
         if "lock" in str(e) or "No such file or directory" in str(e):
             print(
                 f"[Eval] Lock file error during compilation, Please retry. Error: {e}"
             )
-            _cleanup()
+            _cleanup(cleanup_build_dir=_failed_build_dir)
             return None
         metadata["compilation_error_name"] = get_error_name(e)
         metadata["compilation_error"] = e
         _record_memory_peak(metadata, device)
-        _cleanup()
+        _cleanup(cleanup_build_dir=_failed_build_dir)
         _record_phase(metadata, "load", time.perf_counter() - _load_phase_start)
         _record_phase(metadata, "total", time.perf_counter() - _total_phase_start)
         return KernelExecResult(compiled=False, metadata=metadata)
