@@ -122,6 +122,7 @@ class KernelBenchToolkit(Toolkit):
                 custom_model_src=task.kernel_code,
                 num_correct_trials=num_correct_trials,
                 num_perf_trials=task.num_perf_trials,
+                num_warmup=task.num_warmup,
                 measure_performance=measure_performance,
                 verbose=False,
                 device=device,
@@ -140,6 +141,7 @@ class KernelBenchToolkit(Toolkit):
             reference_runtime = kernelbench_pipeline.eval_reference_only(
                 original_model_src=task.reference_code,
                 num_perf_trials=task.num_perf_trials,
+                num_warmup=task.num_warmup,
                 verbose=False,
                 device=device,
                 entry_point=task.entry_point,
@@ -155,6 +157,7 @@ class KernelBenchToolkit(Toolkit):
                     "backend": task.backend,
                     "num_correct_trials": num_correct_trials,
                     "num_perf_trials": task.num_perf_trials,
+                    "num_warmup": task.num_warmup,
                 }
             )
 
@@ -206,6 +209,7 @@ class KernelBenchToolkit(Toolkit):
             ref_exec_result = kernelbench_pipeline.eval_reference_only(
                 original_model_src=task.reference_code,
                 num_perf_trials=task.num_perf_trials,
+                num_warmup=task.num_warmup,
                 verbose=False,
                 device=device,
                 entry_point=task.entry_point,
@@ -219,6 +223,7 @@ class KernelBenchToolkit(Toolkit):
                 "gpu_name": torch.cuda.get_device_name(device),
                 "backend": task.backend,
                 "num_perf_trials": task.num_perf_trials,
+                "num_warmup": task.num_warmup,
             }
             if ref_exec_result.metadata:
                 metadata.update(ref_exec_result.metadata)
@@ -296,6 +301,7 @@ class KernelBenchToolkit(Toolkit):
                 custom_model_src=task.kernel_code,
                 num_correct_trials=num_correct_trials,
                 num_perf_trials=task.num_perf_trials,
+                num_warmup=task.num_warmup,
                 measure_performance=measure_performance,
                 verbose=False,
                 device=device,
@@ -320,6 +326,7 @@ class KernelBenchToolkit(Toolkit):
                     "backend": task.backend,
                     "num_correct_trials": num_correct_trials,
                     "num_perf_trials": task.num_perf_trials,
+                    "num_warmup": task.num_warmup,
                 }
             )
 

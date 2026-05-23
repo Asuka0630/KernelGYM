@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -13,6 +14,25 @@ from kernelgym.toolkit.kernelbench.profiling import (
 )
 
 
+def _record_phase_ms(
+    metadata: Optional[Dict[str, Any]], phase: str, elapsed_sec: float
+) -> None:
+    """Record/aggregate ``phase`` wall-time (ms) under
+    ``metadata['phase_timings_ms']``. No-op when metadata is None.
+    """
+    if metadata is None:
+        return
+    bucket = metadata.setdefault("phase_timings_ms", {})
+    elapsed_ms = float(elapsed_sec) * 1000.0
+    if phase in bucket:
+        try:
+            bucket[phase] = float(bucket[phase]) + elapsed_ms
+        except (TypeError, ValueError):
+            bucket[phase] = elapsed_ms
+    else:
+        bucket[phase] = elapsed_ms
+
+
 def time_execution_with_cuda_event(
     kernel_fn: callable,
     *args,
@@ -21,21 +41,25 @@ def time_execution_with_cuda_event(
     verbose: bool = True,
     device: torch.device = None,
     enable_profiling: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[float], Dict[str, Any]]:
     if device is None:
         if verbose:
             print(f"Using current device: {torch.cuda.current_device()}")
         device = torch.cuda.current_device()
 
+    _warmup_start = time.perf_counter()
     for _ in range(num_warmup):
         kernel_fn(*args)
         torch.cuda.synchronize(device=device)
+    _record_phase_ms(metadata, "performance.measure.warmup", time.perf_counter() - _warmup_start)
 
     print(
         f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
     )
     elapsed_times = []
 
+    _trials_start = time.perf_counter()
     for trial in range(num_trials):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -50,9 +74,11 @@ def time_execution_with_cuda_event(
         if verbose:
             print(f"Trial {trial + 1}: {elapsed_time_ms:.3g} ms")
         elapsed_times.append(elapsed_time_ms)
+    _record_phase_ms(metadata, "performance.measure.timing_trials", time.perf_counter() - _trials_start)
 
     profiling_metrics: Dict[str, Any] = {}
     if enable_profiling:
+        _prof_start = time.perf_counter()
         try:
             torch.cuda.synchronize(device=device)
 
@@ -78,6 +104,10 @@ def time_execution_with_cuda_event(
         except Exception as e:
             print(f"[Profiling] Warning: Profiling failed: {e}")
             profiling_metrics = {"profiling_error": str(e)}
+        finally:
+            _record_phase_ms(
+                metadata, "performance.profiling_inline", time.perf_counter() - _prof_start
+            )
 
     return elapsed_times, profiling_metrics
 

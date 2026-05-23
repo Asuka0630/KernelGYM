@@ -129,6 +129,13 @@ class KernelBenchWorkflowController(WorkflowController):
             self._persist_result(eval_task, result)
             return result
 
+        # Caller asked us to skip reference timing entirely.  Return early
+        # with kernel-only metrics; reference_runtime/speedup will be -1/0.
+        if getattr(eval_task, "skip_reference", False):
+            result = self._kernel_only_result(eval_task, kernel_result)
+            self._persist_result(eval_task, result)
+            return result
+
         ref_result: Optional[ReferenceTimingResult] = None
         if ref_task is None:
             cached_runtime = _get_cached_reference_runtime(
@@ -143,6 +150,7 @@ class KernelBenchWorkflowController(WorkflowController):
                         reference_code=eval_task.reference_code,
                         backend=eval_task.backend,
                         num_perf_trials=eval_task.num_perf_trials,
+                        num_warmup=eval_task.num_warmup,
                         timeout=eval_task.timeout,
                         device=eval_task.device,
                         priority=eval_task.priority,

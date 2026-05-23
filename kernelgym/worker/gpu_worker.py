@@ -407,7 +407,20 @@ class GPUWorker:
         if "backend_adapter" not in task_data:
             raise ValueError("Task payload missing required 'backend_adapter'")
 
+        import time as _time
+        _dispatch_start = _time.perf_counter()
         result_dict = await self._run_toolkit_task(task_data)
+        _dispatch_elapsed = _time.perf_counter() - _dispatch_start
+
+        # Annotate the result with how long this worker layer spent dispatching
+        # the task (await + thread-pool + subprocess IPC). 
+        try:
+            md = result_dict.get("metadata") if isinstance(result_dict, dict) else None
+            if isinstance(md, dict):
+                bucket = md.setdefault("phase_timings_ms", {})
+                bucket["worker_dispatch"] = float(_dispatch_elapsed) * 1000.0
+        except Exception:
+            pass
 
         status = result_dict.get("status")
         error_message = result_dict.get("error_message") or "Task failed"

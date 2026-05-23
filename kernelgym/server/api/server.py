@@ -351,9 +351,24 @@ async def _execute_workflow(
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    import time as _time
+    _server_start = _time.perf_counter()
     result = await controller.handle_request(payload, scheduler)
+    _server_elapsed = _time.perf_counter() - _server_start
+
     if isinstance(result, dict):
         result.setdefault("task_id", task_id)
+        # Annotate with the server-side wall-time spent inside
+        # ``controller.handle_request`` (scheduler submit + redis pubsub +
+        # awaiting worker completion). Subtract the worker-level totals to
+        # pinpoint where time goes between HTTP and pipeline.
+        try:
+            md = result.get("metadata") if isinstance(result, dict) else None
+            if isinstance(md, dict):
+                bucket = md.setdefault("phase_timings_ms", {})
+                bucket["server_scheduler"] = float(_server_elapsed) * 1000.0
+        except Exception:
+            pass
     await task_mgr.complete_task(task_id, result)
     return task_id, result, _result_status(result)
 
@@ -421,6 +436,7 @@ async def debug_validate(request: EvaluationRequest):
         "backend": request.backend,
         "num_correct_trials": request.num_correct_trials,
         "num_perf_trials": request.num_perf_trials,
+        "num_warmup": request.num_warmup,
         "timeout": request.timeout,
         "priority": request.priority,
         "device_preference": request.device_preference,

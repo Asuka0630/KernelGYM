@@ -48,7 +48,10 @@ def _create_paired_tasks(
     kernel_device = task.device
 
     reference_task: Optional[ReferenceTimingTask] = None
-    if task.use_reference_cache and task.uuid:
+    if getattr(task, "skip_reference", False):
+        # patch: skip reference task
+        reference_task = None
+    elif task.use_reference_cache and task.uuid:
         cached_runtime = _get_cached_reference_runtime(
             task.uuid, task.reference_code, task.is_valid
         )
@@ -61,6 +64,7 @@ def _create_paired_tasks(
                 backend_adapter=task.backend_adapter,
                 backend=task.backend,
                 num_perf_trials=task.num_perf_trials,
+                num_warmup=task.num_warmup,
                 timeout=task.timeout,
                 device=ref_device,
                 priority=task.priority,
@@ -78,6 +82,7 @@ def _create_paired_tasks(
             backend_adapter=task.backend_adapter,
             backend=task.backend,
             num_perf_trials=task.num_perf_trials,
+            num_warmup=task.num_warmup,
             timeout=task.timeout,
             device=ref_device,
             priority=task.priority,
@@ -97,6 +102,7 @@ def _create_paired_tasks(
         backend=task.backend,
         num_correct_trials=task.num_correct_trials,
         num_perf_trials=task.num_perf_trials,
+        num_warmup=task.num_warmup,
         timeout=task.timeout,
         device=kernel_device,
         priority=task.priority,

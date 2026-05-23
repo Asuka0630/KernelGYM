@@ -249,9 +249,9 @@ GPU_DEVICE_MAP = {
 }
 
 TASK_CONFIGS = {
-    "quick": {"num_correct_trials": 3, "num_perf_trials": 10, "timeout": 60, "priority": "high"},
-    "standard": {"num_correct_trials": 5, "num_perf_trials": 100, "timeout": 300, "priority": "normal"},
-    "thorough": {"num_correct_trials": 10, "num_perf_trials": 1000, "timeout": 600, "priority": "low"},
+    "quick": {"num_correct_trials": 3, "num_perf_trials": 10, "num_warmup": 1, "timeout": 60, "priority": "high"},
+    "standard": {"num_correct_trials": 5, "num_perf_trials": 100, "num_warmup": 5, "timeout": 300, "priority": "normal"},
+    "thorough": {"num_correct_trials": 10, "num_perf_trials": 1000, "num_warmup": 10, "timeout": 600, "priority": "low"},
 }
 
 

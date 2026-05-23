@@ -190,8 +190,6 @@ class PersistentWorker:
         if not self.is_alive():
             raise RuntimeError(f"[{self.worker_id}] Worker is not alive")
 
-        start_time = time.time()
-
         # 发送任务
         try:
             self.task_queue.put(task_data, timeout=5)
@@ -201,7 +199,6 @@ class PersistentWorker:
         # 等待结果
         try:
             result = self.result_queue.get(timeout=timeout)
-            exec_time = time.time() - start_time
 
             # 检查 worker 是否报告 CUDA error 并准备退出
             if result.get("worker_exiting") is True:
