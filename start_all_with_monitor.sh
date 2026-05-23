@@ -65,7 +65,15 @@ if [ -n "${LOG_DIR_OVERRIDE}" ]; then
     LOG_DIR="${LOG_DIR_OVERRIDE}"
 fi
 
+# Append a timestamped subdirectory so each run writes to its own folder.
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+LOG_DIR="${LOG_DIR%/}/${TIMESTAMP}"
+
 mkdir -p "${ROOT_DIR}/${LOG_DIR}"
+
+# Export LOG_DIR (absolute path) so Python processes log into the same
+# timestamped directory instead of creating yet another nested one.
+export LOG_DIR="${ROOT_DIR}/${LOG_DIR}"
 
 REDIS_HOST="${REDIS_HOST:-localhost}"
 REDIS_PORT="${REDIS_PORT:-6379}"
@@ -107,12 +115,12 @@ if ! port_is_open "${REDIS_HOST}" "${REDIS_PORT}"; then
 fi
 
 echo "Starting API server..."
-python -m kernelgym.server.api.server > "${ROOT_DIR}/${LOG_DIR}/api_server.log" 2>&1 &
+python -m kernelgym.server.api.server > "${LOG_DIR}/api_server.log" 2>&1 &
 API_PID=$!
 echo "API server PID: ${API_PID}"
 
 echo "Starting worker monitor..."
-python -m kernelgym.worker.worker_monitor --persistent > "${ROOT_DIR}/${LOG_DIR}/worker_monitor.log" 2>&1 &
+python -m kernelgym.worker.worker_monitor --persistent > "${LOG_DIR}/worker_monitor.log" 2>&1 &
 MONITOR_PID=$!
 echo "Worker monitor PID: ${MONITOR_PID}"
 
@@ -157,7 +165,7 @@ for gpu in ${GPU_LIST}; do
         --worker-id "${WORKER_ID}" \
         --device "cuda:${gpu}" \
         --persistent \
-        > "${ROOT_DIR}/${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
+        > "${LOG_DIR}/worker_gpu_${gpu}.log" 2>&1 &
     WORKER_PID=$!
 
     if command -v redis-cli >/dev/null 2>&1; then
@@ -176,4 +184,4 @@ for gpu in ${GPU_LIST}; do
 done
 
 echo "KernelGym started."
-echo "Logs: ${ROOT_DIR}/${LOG_DIR}"
+echo "Logs: ${LOG_DIR}"
