@@ -468,7 +468,23 @@ def eval_kernel_against_ref(
     enable_profiling: bool = True,
     enable_triton_detection: bool = True,
     backend_adapter: Optional[Any] = None,
+    precompiled_artifact: Optional[Dict[str, Any]] = None,
 ) -> KernelExecResult:
+    """Evaluate a custom kernel against a reference model.
+
+    Parameters
+    ----------
+    precompiled_artifact : dict, optional
+        When provided, the GPU subprocess **skips** ``backend_adapter.compile()``
+        entirely and goes straight to ``backend_adapter.load(artifact, ...)``.
+        This is the stage-2 entry point for the off-GPU compile pipeline
+        (see :class:`kernelgym.worker.compile_offload.CompileOffloadPool`):
+        the artifact has already been produced by a CPU compile worker, so
+        the GPU subprocess only pays the ``dlopen`` + warm-up cost, not the
+        full nvcc compile.
+
+        Cuda backend only. Triton/legacy paths ignore this argument.
+    """
     _total_phase_start = time.perf_counter()
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
     metadata: Dict[str, Any] = {}
@@ -559,13 +575,64 @@ def eval_kernel_against_ref(
         os.environ["TORCH_USE_CUDA_DSA"] = "1"
         with _timed(metadata, "load.compile_or_load_custom"):
             if backend_adapter is not None:
-                artifact = backend_adapter.compile(
-                    custom_model_src,
-                    device=device,
-                    backend=backend,
-                    entry_point=f"{entry_point}New",
-                    build_dir=build_dir,
-                )
+                # ----------------------------------------------------------
+                # Two-stage off-GPU compile path.
+                #
+                # If a stage-1 artifact was attached to the task (cuda
+                # backend only), reuse it instead of re-running compile()
+                # inside the GPU subprocess. backend_adapter.load() is a
+                # fast dlopen + module import; the actual nvcc cost has
+                # already been paid in the CompileOffloadPool worker.
+                # ----------------------------------------------------------
+                if (
+                    isinstance(precompiled_artifact, dict)
+                    and precompiled_artifact.get("compiled")
+                    and (precompiled_artifact.get("backend") or backend) != "triton"
+                ):
+                    artifact = dict(precompiled_artifact)
+                    artifact.setdefault("device", str(device))
+                    artifact.setdefault("entry_point", f"{entry_point}New")
+                    artifact.setdefault("backend", backend)
+                    # The dispatcher strips ``code`` from the artifact before
+                    # the IPC hop to keep the payload small. Restore it from
+                    # ``custom_model_src`` so backend.load() can ``exec`` it
+                    # in this subprocess (cached .so from build_dir is
+                    # transparently reused via PyTorch's content-hashed
+                    # extension cache).
+                    if not artifact.get("code"):
+                        artifact["code"] = custom_model_src
+                    if build_dir is None:
+                        build_dir = artifact.get("build_dir")
+                    metadata["compile_offloaded"] = True
+                    # Surface CPU-side compile timings so the bench phase
+                    # table shows where the work went. Three buckets:
+                    #   * compile_offload          -- pure nvcc wall-time
+                    #   * compile_offload_queue_wait -- waiting for a free
+                    #     pool slot in the compile_service (zero when the
+                    #     pool is large enough to absorb concurrency).
+                    # The legacy ``load.compile_or_load_custom`` will
+                    # additionally cover the GPU-side dlopen/import that
+                    # follows below.
+                    if "elapsed_sec" in artifact:
+                        _record_phase(
+                            metadata,
+                            "compile_offload",
+                            float(artifact.get("elapsed_sec") or 0.0),
+                        )
+                    if "queue_wait_sec" in artifact:
+                        _record_phase(
+                            metadata,
+                            "compile_offload_queue_wait",
+                            float(artifact.get("queue_wait_sec") or 0.0),
+                        )
+                else:
+                    artifact = backend_adapter.compile(
+                        custom_model_src,
+                        device=device,
+                        backend=backend,
+                        entry_point=f"{entry_point}New",
+                        build_dir=build_dir,
+                    )
                 if not artifact.get("compiled"):
                     error = artifact.get("error", "Unknown compile error")
                     failed_build_dir = artifact.get("build_dir")

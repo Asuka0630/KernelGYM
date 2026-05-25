@@ -6,8 +6,10 @@ Version: v0.3.3-rc - Worker Pool for performance optimization with CUDA error is
 """
 import asyncio
 import logging
+import os
 import signal
 import sys
+import threading
 from datetime import datetime
 from typing import Dict, Any, Optional
 import redis.asyncio as redis
@@ -193,12 +195,14 @@ class GPUWorker:
 
             # Start heartbeat task
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            
+
             # Start main processing loop
             processing_task = asyncio.create_task(self._processing_loop())
-            
+
             # Wait for either task to complete
-            await asyncio.gather(heartbeat_task, processing_task, return_exceptions=True)
+            await asyncio.gather(
+                heartbeat_task, processing_task, return_exceptions=True
+            )
             
         except Exception as e:
             logger.error(f"Error in worker {self.worker_id}: {e}")
@@ -300,79 +304,114 @@ class GPUWorker:
     async def _processing_loop(self):
         """Main processing loop."""
         logger.info(f"Worker {self.worker_id} processing loop started")
-        
+
         while self.running:
             try:
-                # Note: In subprocess isolation architecture, CUDA error count is no longer used
-                # as errors are contained in subprocesses and don't affect the main worker
-                
-                # Get next task
                 task_data = await self.task_manager.get_next_task(self.worker_id)
-                
+
                 if task_data:
+                    await self._maybe_attach_artifact(task_data)
                     await self._process_task(task_data)
                 else:
-                    # No tasks available. get_next_task 已 BRPOP(1s)，此处仅做极短休眠避免忙等
+                    # No tasks available. get_next_task already BRPOP'd for
+                    # 1s; a brief sleep avoids busy-looping when the queue
+                    # is genuinely empty.
                     await asyncio.sleep(0.1)
-                    
+
             except Exception as e:
                 logger.error(f"Error in processing loop for worker {self.worker_id}: {e}")
-                
+
                 # Distinguish between subprocess errors and main process errors
                 from kernelgym.server.code_retry_manager import CodeRetryManager
                 if CodeRetryManager(self.redis)._is_memory_error(str(e)):
-                    # This is likely from a subprocess, no need to restart main worker
                     logger.info(f"[SUBPROCESS-ISOLATION] CUDA error detected in loop for worker {self.worker_id}, but isolated in subprocess")
                 else:
-                    # This is a main process error, track it
                     self.main_process_error_count += 1
                     logger.warning(f"Main process error in worker {self.worker_id}: {self.main_process_error_count}/{self.max_main_process_errors}")
-                    
-                    # If too many main process errors, shutdown for restart
+
                     if self.main_process_error_count >= self.max_main_process_errors:
                         logger.error(f"Worker {self.worker_id} main process has too many errors. Shutting down for restart.")
                         await self.redis.hset(
                             f"{KEY_PREFIX}:worker:{self.worker_id}",
                             mapping={
-                                "cuda_error_shutdown": "true",  # Reuse this flag for any critical shutdown
+                                "cuda_error_shutdown": "true",
                                 "shutdown_reason": "main_process_errors",
                                 "shutdown_time": datetime.now().isoformat()
                             }
                         )
                         self.running = False
                         break
-                
-                await asyncio.sleep(5)  # Sleep longer on error
-    
+
+                await asyncio.sleep(5)
+
+    async def _maybe_attach_artifact(self, task_data: Dict[str, Any]) -> None:
+        """If the compile_service produced an artifact for this task, attach it.
+
+        The compile_service writes the slim artifact dict to
+        ``<prefix>:artifact:<task_id>`` (HSET ``data`` as JSON).
+        We pop-and-read it here and attach it to ``task_data`` so the
+        toolkit pipeline skips ``backend.compile()``.
+
+        For tasks that bypass the compile_service (triton, reference_timing,
+        no kernel_code) the key simply doesn't exist and we no-op.
+        """
+        task_id = task_data.get("task_id")
+        if not task_id:
+            return
+        artifact_key = f"{KEY_PREFIX}:artifact:{task_id}"
+        try:
+            raw = await self.redis.hget(artifact_key, "data")
+        except Exception as exc:  # noqa: BLE001 - never break dispatch.
+            logger.warning(
+                f"Failed to read artifact for task {task_id}: {exc}; "
+                f"GPU subprocess will compile from scratch."
+            )
+            return
+        if not raw:
+            return
+        try:
+            import json
+            artifact = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception as exc:  # noqa: BLE001 - corrupt payload.
+            logger.warning(
+                f"Failed to decode artifact for task {task_id}: {exc}"
+            )
+            return
+        if isinstance(artifact, dict) and artifact.get("compiled"):
+            task_data["precompiled_artifact"] = artifact
+            build_dir = artifact.get("build_dir")
+            if build_dir:
+                task_data["build_dir"] = build_dir
+        # Best-effort cleanup; if delete fails (e.g. eviction race) we
+        # don't care -- the artifact has TTL set by compile_service.
+        try:
+            await self.redis.delete(artifact_key)
+        except Exception:
+            pass
+
     async def _process_task(self, task_data: Dict[str, Any]):
-        """Process a single task."""
+        """Process a single task on the GPU subprocess."""
         task_id = task_data["task_id"]
         self.current_task = task_id
         start_time = datetime.now()
-        
+
         try:
             logger.info(f"Worker {self.worker_id} processing task {task_id}")
 
             await self._process_toolkit_task(task_data, start_time)
-            
-            # Reset CUDA error count on successful completion
+
             self.cuda_error_count = 0
-            
-            # Clear retry history if this was a retry
+
             if "_retry" in task_id:
-                # Extract original task ID
                 original_task_id = task_id.rsplit("_retry", 1)[0]
                 await self.task_manager.retry_manager.clear_retry_history(original_task_id)
-            
+
         except Exception as e:
-            # Task failed
             error_message = f"Task processing failed: {str(e)}"
             logger.error(f"Worker {self.worker_id} failed task {task_id}: {error_message}")
-            
-            # Track CUDA errors for monitoring, but don't auto-restart in subprocess isolation mode
+
             from kernelgym.server.code_retry_manager import CodeRetryManager
             if CodeRetryManager(self.redis)._is_memory_error(str(e)):
-                # Try to print code content from task_data for debugging
                 try:
                     if task_data.get("reference_code"):
                         logger.error(f"[MEMORY-ERROR] Task {task_id} reference_code below:\n{task_data['reference_code']}")
@@ -380,24 +419,23 @@ class GPUWorker:
                         logger.error(f"[MEMORY-ERROR] Task {task_id} kernel_code below:\n{task_data['kernel_code']}")
                 except Exception:
                     pass
-                
-                # Track CUDA errors for monitoring
+
                 self._track_cuda_error()
                 logger.info(f"[SUBPROCESS-ISOLATION] CUDA error contained in subprocess for task {task_id}, worker continues normally")
-            
+
             error_code = classify_error(str(e), "runtime")
             failed_result = self._build_failed_result(task_data, error_message, error_code)
             await self.task_manager.complete_task(task_id, failed_result)
-            
-            # Update statistics
+
             self.stats["tasks_failed"] += 1
-            
+
         finally:
-            # GPU清理由subprocess自动处理
             self.current_task = None
             self.tasks_processed += 1
 
-    async def _process_toolkit_task(self, task_data: Dict[str, Any], start_time: datetime):
+    async def _process_toolkit_task(
+        self, task_data: Dict[str, Any], start_time: datetime
+    ):
         """Process task via toolkit/backend abstractions."""
         task_id = task_data["task_id"]
 
@@ -413,12 +451,18 @@ class GPUWorker:
         _dispatch_elapsed = _time.perf_counter() - _dispatch_start
 
         # Annotate the result with how long this worker layer spent dispatching
-        # the task (await + thread-pool + subprocess IPC). 
+        # the task (await + thread-pool + subprocess IPC).
         try:
             md = result_dict.get("metadata") if isinstance(result_dict, dict) else None
             if isinstance(md, dict):
                 bucket = md.setdefault("phase_timings_ms", {})
-                bucket["worker_dispatch"] = float(_dispatch_elapsed) * 1000.0
+                dispatch_ms = float(_dispatch_elapsed) * 1000.0
+                bucket["worker_dispatch"] = dispatch_ms
+                total_ms = bucket.get("total")
+                if isinstance(total_ms, (int, float)) and total_ms > 0:
+                    overhead_ms = dispatch_ms - float(total_ms)
+                    if overhead_ms > 0:
+                        bucket["worker_dispatch.overhead"] = overhead_ms
         except Exception:
             pass
 
@@ -523,6 +567,7 @@ class GPUWorker:
             raise RuntimeError(f"{error_type}: {error_message}")
 
         return result_data["result"]
+
     
     def _update_task_stats(self, processing_time: float, success: bool):
         """Update task statistics."""

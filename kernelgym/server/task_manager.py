@@ -100,6 +100,16 @@ class TaskManager:
             Priority.NORMAL: f"{self.queue_prefix}priority:normal",
             Priority.LOW: f"{self.queue_prefix}priority:low",
         }
+        # Compile-stage queues. When compile off-load is enabled, cuda
+        # tasks with kernel_code are routed here first.
+        self.compile_queues = {
+            Priority.HIGH: f"{self.queue_prefix}compile:priority:high",
+            Priority.NORMAL: f"{self.queue_prefix}compile:priority:normal",
+            Priority.LOW: f"{self.queue_prefix}compile:priority:low",
+        }
+        # Per-task compile artifact written by compile_service so the
+        # GPU worker can attach it to task_data["precompiled_artifact"].
+        self.artifact_prefix = f"{self.key_prefix}:artifact:"
         self.worker_queues: Dict[str, str] = {}
         self.active_tasks: Dict[str, TaskInfo] = {}
         self.worker_registry: Dict[str, Dict[str, Any]] = {}
@@ -309,6 +319,18 @@ class TaskManager:
         """Compatibility entrypoint: treat as a normal task submission."""
         return await self.submit_task(task_data)
 
+    @staticmethod
+    def _needs_compile_offload(task_data: Dict[str, Any]) -> bool:
+        """Decide whether a task should go through the compile_service"""
+        if not getattr(settings, "enable_compile_offload", True):
+            return False
+        if not task_data.get("kernel_code"):
+            return False
+        backend = (task_data.get("backend") or "").strip().lower()
+        if backend != "cuda":
+            return False
+        return True
+
     async def submit_task(self, task_data: Dict[str, Any]) -> str:
         task_data = dict(task_data)
         if not task_data.get("toolkit"):
@@ -358,6 +380,9 @@ class TaskManager:
             worker_queue_key = f"{self.queue_prefix}worker:{assigned_worker}"
             self.worker_queues.setdefault(assigned_worker, worker_queue_key)
             await self.redis.lpush(worker_queue_key, task_id)
+        elif self._needs_compile_offload(task_data):
+            queue_key = self.compile_queues[priority]
+            await self.redis.lpush(queue_key, task_id)
         else:
             queue_key = self.priority_queues[priority]
             await self.redis.lpush(queue_key, task_id)
@@ -408,6 +433,78 @@ class TaskManager:
         started_at = datetime.now().isoformat()
         await self.redis.hset(task_key, mapping={"status": TaskStatus.PROCESSING.value, "started_at": started_at})
         return task_json
+
+    async def get_next_compile_task(
+        self,
+        timeout: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """BRPOP a task from the compile priority queues."""
+        # Build the BRPOP key list in priority order across all known
+        # prefixes so a co-existing legacy deployment is drained too.
+        keys = []
+        for prefix in self._prefixes_for_read():
+            for priority in (Priority.HIGH, Priority.NORMAL, Priority.LOW):
+                keys.append(f"{prefix}:queue:compile:priority:{priority.value}")
+        try:
+            popped = await self.redis.brpop(keys, timeout=timeout)
+        except Exception as exc:
+            logger.error(f"BRPOP on compile queues failed: {exc}")
+            return None
+        if not popped:
+            return None
+
+        # popped = (queue_key, task_id)
+        _, task_id = popped
+        task_id = task_id.decode() if isinstance(task_id, bytes) else task_id
+
+        # Fetch the task payload (the task hash itself was written by
+        # submit_task before LPUSH-ing the queue).
+        for prefix in self._prefixes_for_read():
+            task_key = f"{prefix}:task:{task_id}"
+            data = await self.redis.hgetall(task_key)
+            if not data:
+                continue
+            raw = data.get(b"data")
+            if not raw:
+                continue
+            try:
+                return json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception as exc:
+                logger.error(f"Corrupt task payload for {task_id}: {exc}")
+                return None
+        logger.warning(f"Compile queue popped {task_id} but no task hash found")
+        return None
+
+    async def store_artifact(
+        self,
+        task_id: str,
+        artifact: Dict[str, Any],
+        ttl_sec: int = 3600,
+    ) -> None:
+        """Persist a slim compile artifact for the GPU worker to read.
+
+        Called by compile_service after a successful nvcc build. The GPU
+        worker pops the same key in ``_maybe_attach_artifact`` and
+        forwards it to the toolkit pipeline as ``precompiled_artifact``.
+        TTL guards against orphan keys when a GPU worker crashes mid-task.
+        """
+        payload = json.dumps(artifact)
+        await self.redis.hset(
+            f"{self.artifact_prefix}{task_id}",
+            mapping={"data": payload, "stored_at": datetime.now().isoformat()},
+        )
+        if ttl_sec > 0:
+            await self.redis.expire(f"{self.artifact_prefix}{task_id}", ttl_sec)
+
+    async def enqueue_to_gpu_queue(self, task_id: str, priority: Priority) -> None:
+        """LPUSH a compiled task into the regular GPU priority queue.
+
+        The compile_service calls this once stage 1 finishes successfully.
+        The GPU worker side is unchanged: it just does a regular BRPOP
+        from the priority queues and reads the artifact via Redis.
+        """
+        queue_key = self.priority_queues[priority]
+        await self.redis.lpush(queue_key, task_id)
 
     async def complete_task(self, task_id: str, result: Dict[str, Any]):
         completed_at = datetime.now().isoformat()
