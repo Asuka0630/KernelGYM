@@ -456,9 +456,11 @@ class GPUWorker:
             md = result_dict.get("metadata") if isinstance(result_dict, dict) else None
             if isinstance(md, dict):
                 bucket = md.setdefault("phase_timings_ms", {})
+                for key in list(bucket.keys()):
+                    bucket[f"worker_dispatch.{key}"] = bucket.pop(key)
                 dispatch_ms = float(_dispatch_elapsed) * 1000.0
                 bucket["worker_dispatch"] = dispatch_ms
-                total_ms = bucket.get("total")
+                total_ms = bucket.pop("worker_dispatch.total", None)
                 if isinstance(total_ms, (int, float)) and total_ms > 0:
                     overhead_ms = dispatch_ms - float(total_ms)
                     if overhead_ms > 0:
