@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -52,8 +52,19 @@ class KernelBenchToolkit(Toolkit):
 
     def evaluate(self, task: Dict[str, Any], backend=None, **kwargs: Any) -> Dict[str, Any]:
         task_type = task.get("task_type", "evaluation")
+        # The off-GPU compile pipeline (kernelgym.worker.compile_service)
+        # attaches its stage-1 artifact + build_dir directly to the task
+        # payload. Forward those into the typed helpers so the pipeline can
+        # bypass backend.compile() entirely.
+        precompiled_artifact = task.get("precompiled_artifact")
+        attached_build_dir = task.get("build_dir")
         if task_type == "evaluation":
-            result = self.evaluate_kernel(EvaluationTask.from_dict(task), backend_adapter=backend)
+            result = self.evaluate_kernel(
+                EvaluationTask.from_dict(task),
+                backend_adapter=backend,
+                precompiled_artifact=precompiled_artifact,
+                attached_build_dir=attached_build_dir,
+            )
         elif task_type == "reference_timing":
             result = self.evaluate_reference_timing(
                 ReferenceTimingTask.from_dict(task),
@@ -65,13 +76,21 @@ class KernelBenchToolkit(Toolkit):
                 verbose_errors=task.get("verbose_errors", True),
                 enable_profiling=task.get("enable_profiling", settings.enable_profiling),
                 backend_adapter=backend,
+                precompiled_artifact=precompiled_artifact,
+                attached_build_dir=attached_build_dir,
             )
         else:
             raise ValueError(f"Unknown task_type: {task_type}")
 
         return result.to_dict()
 
-    def evaluate_kernel(self, task: EvaluationTask, backend_adapter=None) -> EvaluationResult:
+    def evaluate_kernel(
+        self,
+        task: EvaluationTask,
+        backend_adapter=None,
+        precompiled_artifact: Optional[Dict[str, Any]] = None,
+        attached_build_dir: Optional[str] = None,
+    ) -> EvaluationResult:
         device = torch.device(task.device)
 
         ref_valid, ref_error = validate_code(task.reference_code, task.entry_point)
@@ -131,6 +150,8 @@ class KernelBenchToolkit(Toolkit):
                 enable_profiling=bool(enable_profiling),
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
+                build_dir=attached_build_dir,
+                precompiled_artifact=precompiled_artifact,
             )
 
             if not run_correctness:
@@ -256,6 +277,8 @@ class KernelBenchToolkit(Toolkit):
         verbose_errors: bool = True,
         enable_profiling: bool = False,
         backend_adapter=None,
+        precompiled_artifact: Optional[Dict[str, Any]] = None,
+        attached_build_dir: Optional[str] = None,
     ) -> KernelEvaluationResult:
         device = torch.device(task.device)
 
@@ -310,6 +333,8 @@ class KernelBenchToolkit(Toolkit):
                 enable_profiling=enable_profiling,
                 enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
+                build_dir=attached_build_dir,
+                precompiled_artifact=precompiled_artifact,
             )
 
             if not run_correctness:

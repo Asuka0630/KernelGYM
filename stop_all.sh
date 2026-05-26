@@ -66,6 +66,7 @@ kill_processes "kernelgym.server.api.server" "KernelGym API server"
 kill_processes "kernelgym.worker.worker_monitor" "KernelGym worker monitor"
 kill_processes "kernelgym.worker.single_worker" "KernelGym GPU workers"
 kill_processes "kernelgym.worker.gpu_worker" "KernelGym GPU worker core"
+kill_processes "kernelgym.worker.compile_service" "KernelGym compile service"
 kill_processes "uvicorn.*kernelgym" "Uvicorn server"
 
 echo "Stopping multiprocessing worker processes..."

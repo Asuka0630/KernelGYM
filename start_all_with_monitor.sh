@@ -114,6 +114,30 @@ if ! port_is_open "${REDIS_HOST}" "${REDIS_PORT}"; then
     sleep 2
 fi
 
+PRE_FLIGHT_PATTERNS=(
+    "kernelgym.server.api.server"
+    "kernelgym.worker.worker_monitor"
+    "kernelgym.worker.single_worker"
+    "kernelgym.worker.gpu_worker"
+    "kernelgym.worker.compile_service"
+)
+STALE_FOUND=0
+for pat in "${PRE_FLIGHT_PATTERNS[@]}"; do
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -f "${pat}" >/dev/null 2>&1; then
+            echo "ERROR: existing process matching '${pat}' is still running."
+            pgrep -af "${pat}" || true
+            STALE_FOUND=1
+        fi
+    fi
+done
+if [ "${STALE_FOUND}" -eq 1 ]; then
+    echo ""
+    echo "Refusing to start: previous KernelGym processes are still alive."
+    echo "Run ${ROOT_DIR}/stop_all.sh first, then retry."
+    exit 1
+fi
+
 echo "Starting API server..."
 python -m kernelgym.server.api.server > "${LOG_DIR}/api_server.log" 2>&1 &
 API_PID=$!
@@ -125,6 +149,27 @@ MONITOR_PID=$!
 echo "Worker monitor PID: ${MONITOR_PID}"
 
 sleep 2
+
+# Compile service: stage 1 of the off-GPU compile pipeline (cuda backend).
+# When ENABLE_COMPILE_OFFLOAD=true (default), this single process drains the
+# compile-stage Redis queues for the whole node and dispatches nvcc to a
+# CPU-only ProcessPoolExecutor. GPU workers then pop the resulting compiled
+# tasks from the regular priority queue. Setting ENABLE_COMPILE_OFFLOAD=false
+# turns the service into a no-op (it still boots but receives nothing,
+# because submit_task routes everything to the GPU queue directly).
+ENABLE_COMPILE_OFFLOAD_VAL="${ENABLE_COMPILE_OFFLOAD:-true}"
+case "${ENABLE_COMPILE_OFFLOAD_VAL,,}" in
+    1|true|yes|on)
+        echo "Starting compile service (off-GPU nvcc pool)..."
+        python -m kernelgym.worker.compile_service > "${LOG_DIR}/compile_service.log" 2>&1 &
+        COMPILE_SERVICE_PID=$!
+        echo "Compile service PID: ${COMPILE_SERVICE_PID}"
+        sleep 1
+        ;;
+    *)
+        echo "Compile off-load disabled (ENABLE_COMPILE_OFFLOAD=${ENABLE_COMPILE_OFFLOAD_VAL}); skipping compile service."
+        ;;
+esac
 
 GPU_LIST="$(python - <<'PY'
 import os, json

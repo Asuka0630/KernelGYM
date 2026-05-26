@@ -39,6 +39,28 @@ class KernelBenchWorkflowController(WorkflowController):
         return validation
 
     async def handle_request(self, input_data: Dict[str, Any], scheduler: SchedulerAPI) -> Dict[str, Any]:
+        import time as _time
+        _ctrl_start = _time.perf_counter()
+        result = await self._do_handle_request(input_data, scheduler)
+        _ctrl_elapsed = _time.perf_counter() - _ctrl_start
+        if isinstance(result, dict):
+            md = result.setdefault("metadata", {})
+            bucket = md.setdefault("phase_timings_ms", {})
+            # Rename all inner phases under controller_wall.
+            for key in list(bucket.keys()):
+                bucket[f"controller_wall.{key}"] = bucket.pop(key)
+            # Promote compile_offload / compile_offload_queue_wait from
+            # under worker_dispatch.  They run on the CPU compile pool
+            # *before* the GPU worker, so they are siblings.
+            for promote in ("compile_offload", "compile_offload_queue_wait"):
+                src = f"controller_wall.worker_dispatch.{promote}"
+                dst = f"controller_wall.{promote}"
+                if src in bucket:
+                    bucket[dst] = bucket.pop(src)
+            bucket["controller_wall"] = float(_ctrl_elapsed) * 1000.0
+        return result
+
+    async def _do_handle_request(self, input_data: Dict[str, Any], scheduler: SchedulerAPI) -> Dict[str, Any]:
         eval_task = EvaluationTask.from_dict(input_data)
         state = WorkflowState({"base_task_id": eval_task.task_id})
 

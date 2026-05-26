@@ -129,6 +129,45 @@ class Settings(BaseSettings):
         env="MAX_TASKS_PER_WORKER",
         description="Max tasks a subprocess worker handles before restart. Set to 1 for per-task isolation.",
     )
+    enable_compile_offload: bool = Field(
+        default=True,
+        env="ENABLE_COMPILE_OFFLOAD",
+        description=(
+            "Off-load nvcc compilation to a CPU-only process pool BEFORE "
+            "dispatching to the GPU subprocess. Cuda backend only; triton "
+            "tasks bypass this and use the legacy in-subprocess path."
+        ),
+    )
+    compile_offload_workers: int = Field(
+        default=32,
+        env="COMPILE_OFFLOAD_WORKERS",
+        description=(
+            "Number of concurrent nvcc compilations in the off-load pool. "
+            "Tune to match CPU/RAM headroom; 2x num_gpus is a good start."
+        ),
+    )
+    compile_offload_timeout_sec: float = Field(
+        default=300.0,
+        env="COMPILE_OFFLOAD_TIMEOUT_SEC",
+        description=(
+            "Hard wall-clock cap on a single off-loaded compile. On timeout "
+            "the task is marked compiled=False and never reaches the GPU."
+        ),
+    )
+    compile_offload_build_root: str = Field(
+        default="",
+        env="COMPILE_OFFLOAD_BUILD_ROOT",
+        description=(
+            "Filesystem root for per-task build directories shared between "
+            "the CPU compile worker and the GPU subprocess. Empty string "
+            "falls back to the system tmpdir."
+        ),
+    )
+    compile_offload_nvcc_threads: str = Field(
+        default="",
+        env="COMPILE_OFFLOAD_NVCC_THREADS",
+        description="Optional NVCC_THREADS override for CPU compile workers.",
+    )
 
     log_dir: str = Field(default="logs", env="LOG_DIR")
     log_to_file: bool = Field(default=True, env="LOG_TO_FILE")
