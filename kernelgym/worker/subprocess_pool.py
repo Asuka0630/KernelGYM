@@ -891,16 +891,24 @@ def _execute_task_in_worker(
         if isinstance(result, dict):
             status = result.get("status")
             error_msg = result.get("error_message")
+            error_code = result.get("error_code")
         else:
             status = getattr(result, "status", None)
             error_msg = getattr(result, "error_message", None)
+            error_code = getattr(result, "error_code", None)
 
-        if status == "failed" and error_msg:
+        # Only treat truly poisoning runtime CUDA errors (illegal memory
+        # access, device-side asserts) as worker-fatal.
+        is_compile_failure = (
+            (isinstance(error_code, str) and "COMPILATION" in error_code.upper())
+            or (error_code is not None and "COMPILATION" in str(error_code).upper())
+        )
+        if status == "failed" and error_msg and not is_compile_failure:
+            low = error_msg.lower()
             if (
-                "CUDA" in error_msg
-                or "cuda" in error_msg.lower()
-                or "illegal memory access" in error_msg.lower()
-                or "device-side assert" in error_msg.lower()
+                "illegal memory access" in low
+                or "device-side assert" in low
+                or "cuda error" in low
             ):
                 raise RuntimeError(f"CUDA error detected: {error_msg}")
 

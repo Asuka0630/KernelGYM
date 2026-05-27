@@ -90,27 +90,31 @@ def _build_compile_failed_result(
 ) -> Dict[str, Any]:
     """Construct a ``compiled=False`` result without involving the GPU.
 
-    Mirrors what ``GPUWorker._build_failed_result`` produces, plus the
-    compile_offload phase timings so the bench summary surfaces them.
-    The phase keys mirror the success path: ``compile_offload`` is the
-    pure nvcc time, ``compile_offload_queue_wait`` is the time the task
-    spent waiting for a free pool slot, and ``load`` mirrors the legacy
-    bucket name so existing clients keep showing it.
+    Aligns the produced metadata / error_message shape with the
+    in-subprocess (``ENABLE_COMPILE_OFFLOAD=false``) path.
     """
     from kernelgym.schema import (
         EvaluationResult,
         KernelEvaluationResult,
     )
+    from kernelgym.toolkit.kernelbench.exec_types import KernelExecResult
 
-    error_code = classify_error(error_message, "compile")
     task_id = task_data.get("task_id", "unknown")
     base_task_id = task_data.get("base_task_id", task_id)
     task_type = task_data.get("task_type", "evaluation")
 
-    metadata = {
-        "error": error_message,
+    # Best-effort recovery of the original exception class name from the
+    # offload worker's "<ClassName>: <message>" prefix
+    # (compile_offload._compile_in_worker writes this format), to align with
+    # the in-subprocess path that records ``get_error_name(e)``.
+    err_name = "compile_error"
+    prefix, sep, _ = error_message.partition(": ")
+    if sep and prefix and " " not in prefix and prefix.isidentifier():
+        err_name = prefix
+
+    metadata: Dict[str, Any] = {
         "compilation_error": error_message,
-        "compilation_error_name": "compile_offload_error",
+        "compilation_error_name": err_name,
         "phase_timings_ms": {
             "compile_offload": float(elapsed_nvcc_sec) * 1000.0,
             "compile_offload_queue_wait": float(queue_wait_sec) * 1000.0,
@@ -120,20 +124,22 @@ def _build_compile_failed_result(
         },
     }
 
+    exec_result = KernelExecResult(
+        compiled=False,
+        correctness=False,
+        decoy_kernel=False,
+        runtime=-1.0,
+        metadata=metadata,
+    )
+
+    kernel_view = KernelEvaluationResult.from_kernel_exec_result(
+        task_id=task_id,
+        base_task_id=base_task_id,
+        result=exec_result,
+    )
+
     if task_type == "kernel_evaluation":
-        result = KernelEvaluationResult(
-            task_id=task_id,
-            base_task_id=base_task_id,
-            compiled=False,
-            correctness=False,
-            decoy_kernel=False,
-            kernel_runtime=-1.0,
-            metadata=metadata,
-            status="failed",
-            error_message=error_message,
-            error_code=error_code,
-        )
-        return result.to_dict()
+        return kernel_view.to_dict()
 
     result = EvaluationResult(
         task_id=task_id,
@@ -143,10 +149,10 @@ def _build_compile_failed_result(
         reference_runtime=-1.0,
         kernel_runtime=-1.0,
         speedup=0.0,
-        metadata=metadata,
+        metadata=kernel_view.metadata,
         status="failed",
-        error_message=error_message,
-        error_code=error_code,
+        error_message=kernel_view.error_message,
+        error_code=kernel_view.error_code,
     )
     return result.to_dict()
 

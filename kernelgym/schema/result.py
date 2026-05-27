@@ -17,6 +17,38 @@ def _filter_fields(cls, data: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in data.items() if k in valid_fields}
 
 
+def _dedup_ninja_echo(log: str) -> str:
+    """Drop ninja's verbatim command-line echo right after ``FAILED:``.
+
+    ninja's output for a failing build step looks like::
+
+        [N/M] <full nvcc/g++ command line>
+        FAILED: <object>
+        <full nvcc/g++ command line>            <-- duplicate of the [N/M] line
+        <actual stderr from the compiler>
+
+    Removing the duplicate keeps the actionable diagnostic.
+    """
+    if not log or "FAILED:" not in log:
+        return log
+    lines = log.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        if line.lstrip().startswith("FAILED:") and i + 1 < len(lines):
+            dup = lines[i + 1]
+            # Treat the next line as a duplicate echo when it appears as
+            # the tail of any previously emitted line (handles ``[N/M] ``
+            # prefix on the first occurrence).
+            if dup and any(prev.endswith(dup) for prev in out[:-1]):
+                i += 2
+                continue
+        i += 1
+    return "\n".join(out)
+
+
 @dataclass
 class ReferenceTimingResult:
     task_id: str
@@ -114,6 +146,15 @@ class KernelEvaluationResult:
                 else:
                     metadata[key] = str(metadata[key])
 
+        # Collapse ninja's redundant command echo in compile-failure logs.
+        # ``torch.utils.cpp_extension`` -> ninja prints, for the failing
+        # step, the full command line *twice* (once as ``[N/M] <cmd>`` and
+        # once again right after ``FAILED:`` before the actual stderr).
+        # Drop the second copy so agents only see the diagnostic.
+        for key in ("compilation_error", "error"):
+            if isinstance(metadata.get(key), str):
+                metadata[key] = _dedup_ninja_echo(metadata[key])
+
         error_message: Optional[str] = None
         error_code: Optional[ErrorCode] = None
 
@@ -127,10 +168,22 @@ class KernelEvaluationResult:
                 error_message = "Kernel compilation failed"
             error_code = ErrorCode.COMPILATION_ERROR
         elif not result.correctness:
-            detail = metadata.get("runtime_error") or metadata.get("error")
-            if detail:
-                error_message = f"Kernel execution failed: {detail}"
+            # Distinguish "kernel raised at runtime" from "kernel returned
+            # numerically wrong output". The former carries an exception
+            # detail in ``runtime_error`` / ``error``; the latter carries
+            # the diff summary in ``correctness_issue`` (e.g.
+            # "Output mismatch; max_difference=[...]"). Surface whichever
+            # one is populated so the LLM agent gets the actionable
+            # detail directly from ``error_message`` without having to
+            # reach into ``metadata``.
+            runtime_detail = metadata.get("runtime_error") or metadata.get("error")
+            correctness_detail = metadata.get("correctness_issue")
+            if runtime_detail:
+                error_message = f"Kernel execution failed: {runtime_detail}"
                 error_code = ErrorCode.RUNTIME_ERROR
+            elif correctness_detail:
+                error_message = f"Kernel produced incorrect results: {correctness_detail}"
+                error_code = ErrorCode.CORRECTNESS_ERROR
             else:
                 error_message = "Kernel produced incorrect results"
                 error_code = ErrorCode.CORRECTNESS_ERROR

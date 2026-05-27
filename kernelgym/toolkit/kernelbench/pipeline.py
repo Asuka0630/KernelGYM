@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Union
@@ -636,7 +637,11 @@ def eval_kernel_against_ref(
                 if not artifact.get("compiled"):
                     error = artifact.get("error", "Unknown compile error")
                     failed_build_dir = artifact.get("build_dir")
-                    if "lock" in str(error) or "No such file or directory" in str(error):
+                    # Only check the Python exception message for lock
+                    # contention, not the captured nvcc output (which may
+                    # contain "blockIdx" etc. that happen to include "lock").
+                    _error_tail = str(error).rsplit("\n", 1)[-1]
+                    if "lock" in _error_tail:
                         print(
                             f"[Eval] Lock file error during compilation, Please retry. Error: {error}"
                         )
@@ -659,16 +664,66 @@ def eval_kernel_against_ref(
                 backend_session = backend_adapter.open_session(backend_handle, device=device)
                 tempfile_handle = backend_handle.get("tempfile_handle")
             else:
-                if is_triton:
-                    ModelNew, tempfile_handle = load_custom_model_with_tempfile(
-                        custom_model_src, entry_point=f"{entry_point}New"
-                    )
-                    if verbose:
-                        print("[Eval] Model with Triton Loaded")
-                else:
-                    ModelNew = load_custom_model(custom_model_src, context, build_dir)
+                # Non-compile-offload path: compilation happens in-process.
+                # ``load_inline(verbose=True)`` writes nvcc output to fd 1
+                # via ``subprocess.run(stdout=1)``.  Capture fd 1+2 at the
+                # OS level so the diagnostic is preserved.
+                _old_1, _old_2 = os.dup(1), os.dup(2)
+                _capture_r_fd, _w = os.pipe()
+                os.dup2(_w, 1)
+                os.dup2(_w, 2)
+                os.close(_w)
+                try:
+                    if is_triton:
+                        ModelNew, tempfile_handle = load_custom_model_with_tempfile(
+                            custom_model_src, entry_point=f"{entry_point}New"
+                        )
+                        if verbose:
+                            print("[Eval] Model with Triton Loaded")
+                    else:
+                        ModelNew = load_custom_model(custom_model_src, context, build_dir)
+                finally:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os.dup2(_old_1, 1)
+                    os.dup2(_old_2, 2)
+                    os.close(_old_1)
+                    os.close(_old_2)
+                # Compilation succeeded – drain and close the capture pipe.
+                try:
+                    os.close(_capture_r_fd)
+                except OSError:
+                    pass
             torch.cuda.synchronize(device=device)
     except Exception as e:
+        # Drain captured fd output (non-blocking) so nvcc diagnostics are
+        # included in the compilation error visible to the client.
+        _compile_output = ""
+        try:
+            _capture_r_fd  # noqa: B018 - only defined in non-offload path
+        except NameError:
+            _capture_r_fd = None
+        if _capture_r_fd is not None:
+            try:
+                import fcntl as _fcntl
+                _fl = _fcntl.fcntl(_capture_r_fd, _fcntl.F_GETFL)
+                _fcntl.fcntl(_capture_r_fd, _fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                _chunks = []
+                while True:
+                    try:
+                        _chunk = os.read(_capture_r_fd, 65536)
+                        if not _chunk:
+                            break
+                        _chunks.append(_chunk)
+                    except (BlockingIOError, OSError):
+                        break
+                _compile_output = b"".join(_chunks).decode("utf-8", errors="replace")
+            finally:
+                try:
+                    os.close(_capture_r_fd)
+                except OSError:
+                    pass
+
         print(
             f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
         )
@@ -680,14 +735,20 @@ def eval_kernel_against_ref(
         except (NameError, AttributeError):
             pass
 
-        if "lock" in str(e) or "No such file or directory" in str(e):
+        if "lock" in str(e):
             print(
                 f"[Eval] Lock file error during compilation, Please retry. Error: {e}"
             )
             _cleanup(cleanup_build_dir=_failed_build_dir)
             return None
+
+        # Prepend raw nvcc output so the full diagnostic reaches the client.
+        _error_msg = str(e)
+        if _compile_output.strip():
+            _error_msg = _compile_output.rstrip() + "\n" + _error_msg
+
         metadata["compilation_error_name"] = get_error_name(e)
-        metadata["compilation_error"] = e
+        metadata["compilation_error"] = _error_msg
         _record_memory_peak(metadata, device)
         _cleanup(cleanup_build_dir=_failed_build_dir)
         _record_phase(metadata, "load", time.perf_counter() - _load_phase_start)
