@@ -78,7 +78,7 @@ class ReferenceTimingResult:
 class KernelEvaluationResult:
     task_id: str
     base_task_id: str
-    compiled: bool
+    compiled: Optional[bool]
     correctness: Optional[bool]
     decoy_kernel: bool
     kernel_runtime: float
@@ -166,7 +166,15 @@ class KernelEvaluationResult:
                 error_message = f"Kernel compilation failed: {detail}"
             else:
                 error_message = "Kernel compilation failed"
-            error_code = ErrorCode.COMPILATION_ERROR
+            # Distinguish "nvcc/build wedged past the budget" (compile
+            # offload pool returned with a TimeoutError) from "code is
+            # syntactically broken" so downstream agents can react
+            # appropriately.
+            detail_str = str(detail).lower() if detail else ""
+            if "timeout" in detail_str or "timed out" in detail_str:
+                error_code = ErrorCode.COMPILATION_TIMEOUT
+            else:
+                error_code = ErrorCode.COMPILATION_ERROR
         elif not result.correctness:
             # Distinguish "kernel raised at runtime" from "kernel returned
             # numerically wrong output". The former carries an exception
@@ -193,7 +201,10 @@ class KernelEvaluationResult:
             base_task_id=base_task_id,
             compiled=result.compiled,
             decoy_kernel=result.decoy_kernel,
-            correctness=result.correctness,
+            # When the kernel never compiled, correctness was never even
+            # attempted -- surface that as None (unknown), not False, so
+            # the downstream client can distinguish "skipped" from "failed".
+            correctness=result.correctness if result.compiled else None,
             kernel_runtime=result.runtime,
             metadata=metadata,
             status="completed" if result.compiled else "failed",
@@ -205,8 +216,8 @@ class KernelEvaluationResult:
 @dataclass
 class EvaluationResult:
     task_id: str
-    compiled: bool
-    correctness: bool
+    compiled: Optional[bool]
+    correctness: Optional[bool]
     decoy_kernel: bool
     reference_runtime: float
     kernel_runtime: float

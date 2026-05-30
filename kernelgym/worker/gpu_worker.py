@@ -20,9 +20,14 @@ import torch
 from kernelgym.config import settings
 KEY_PREFIX = settings.redis_key_prefix
 from kernelgym.config import setup_logging
+from kernelgym.common import ErrorCode
 from kernelgym.server.task_manager import TaskManager
 from kernelgym.server.code_retry_manager import CodeRetryManager
 from kernelgym.utils.error_classifier import classify_error
+from kernelgym.worker.subprocess_pool import (
+    CompilationTimeoutError,
+    RuntimeTimeoutError,
+)
 from aiohttp import ClientConnectorError, ClientResponseError
 
 # Import Worker Pool for persistent subprocess workers
@@ -63,10 +68,8 @@ class GPUWorker:
         # Main process health tracking
         self.main_process_error_count = 0
         self.max_main_process_errors = 3  # If main process itself has errors, we need restart
-        # Per-task timeout (seconds).
-        # Set to 35s to account for any overhead
-        # This prevents false positives for tasks completing at ~30.00x seconds
-        self.per_task_timeout_sec = 35
+        # Per-task wall-clock ceiling (seconds).
+        self.per_task_timeout_sec = float(settings.default_timeout)
 
         # Worker Pool (NEW!)
         # Each GPU worker maintains a pool of subprocess workers
@@ -423,8 +426,23 @@ class GPUWorker:
                 self._track_cuda_error()
                 logger.info(f"[SUBPROCESS-ISOLATION] CUDA error contained in subprocess for task {task_id}, worker continues normally")
 
-            error_code = classify_error(str(e), "runtime")
-            failed_result = self._build_failed_result(task_data, error_message, error_code)
+            # Branch on timeout sub-type so we can emit the precise contract:
+            #   * compilation timeout -> compiled=False, RUNTIME marker absent
+            #   * runtime timeout     -> compiled=True, correctness=None
+            #   * any other failure   -> classify by error_message
+            if isinstance(e, CompilationTimeoutError):
+                error_code = ErrorCode.COMPILATION_TIMEOUT
+                failed_result = self._build_timeout_result(
+                    task_data, error_message, error_code, kind="compile"
+                )
+            elif isinstance(e, RuntimeTimeoutError):
+                error_code = ErrorCode.RUNTIME_TIMEOUT
+                failed_result = self._build_timeout_result(
+                    task_data, error_message, error_code, kind="runtime"
+                )
+            else:
+                error_code = classify_error(str(e), "runtime")
+                failed_result = self._build_failed_result(task_data, error_message, error_code)
             await self.task_manager.complete_task(task_id, failed_result)
 
             self.stats["tasks_failed"] += 1
@@ -548,14 +566,100 @@ class GPUWorker:
         )
         return result.to_dict()
 
+    def _build_timeout_result(
+        self,
+        task_data: Dict[str, Any],
+        error_message: str,
+        error_code: ErrorCode,
+        kind: str,
+    ) -> Dict[str, Any]:
+        """Build a result dict for a wall-clock timeout, encoding which phase
+        the subprocess was in when killed.
+
+        Contract:
+          * kind="compile" -> compiled=False, correctness=None
+              (toolkit never produced a usable kernel binary).
+          * kind="runtime" -> compiled=True,  correctness=None
+              (kernel built fine; correctness/perf hung -- this is a runtime
+              perf bug, NOT a compile bug. Downstream debug agents must not
+              be told to look for syntax/include issues.)
+        """
+        from kernelgym.schema import (
+            EvaluationResult,
+            KernelEvaluationResult,
+            ReferenceTimingResult,
+        )
+
+        task_id = task_data.get("task_id", "unknown")
+        base_task_id = task_data.get("base_task_id", task_id)
+        task_type = task_data.get("task_type", "evaluation")
+
+        compiled_flag: Optional[bool] = False if kind == "compile" else True
+
+        metadata = {
+            "error": error_message,
+            "timeout_kind": kind,           # "compile" | "runtime"
+            "timeout_phase": kind,          # alias: same info, easier to grep
+        }
+
+        if task_type == "reference_timing":
+            # Reference timing has no compile step; any timeout there is by
+            # definition a runtime timeout of the baseline pipeline.
+            result = ReferenceTimingResult(
+                task_id=task_id,
+                base_task_id=base_task_id,
+                reference_runtime=-1.0,
+                metadata=metadata,
+                status="failed",
+                error_message=error_message,
+                error_code=error_code,
+            )
+            return result.to_dict()
+
+        if task_type == "kernel_evaluation":
+            result = KernelEvaluationResult(
+                task_id=task_id,
+                base_task_id=base_task_id,
+                compiled=compiled_flag,
+                correctness=None,
+                decoy_kernel=False,
+                kernel_runtime=-1.0,
+                metadata=metadata,
+                status="failed",
+                error_message=error_message,
+                error_code=error_code,
+            )
+            return result.to_dict()
+
+        result = EvaluationResult(
+            task_id=task_id,
+            compiled=compiled_flag,
+            correctness=None,
+            decoy_kernel=False,
+            reference_runtime=-1.0,
+            kernel_runtime=-1.0,
+            speedup=0.0,
+            metadata=metadata,
+            status="failed",
+            error_message=error_message,
+            error_code=error_code,
+        )
+        return result.to_dict()
+
     async def _run_toolkit_task(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         """Run task payload through worker pool."""
-        per_task_timeout_sec = self.per_task_timeout_sec
-        if "timeout" in task_data:
-            logger.info(
-                f"[Worker] Load per_task_timeout from payload: {task_data['timeout']}"
-            )
-            per_task_timeout_sec = task_data["timeout"]
+        # Effective budget = min(operator ceiling, payload.timeout).
+        # ``payload.timeout`` is pydantic-validated server-side
+        # (EvaluationRequest: ge=10, le=3600) so it's always a positive
+        # int by the time we see it.
+        per_task_timeout_sec = min(
+            self.per_task_timeout_sec, float(task_data["timeout"])
+        )
+        logger.info(
+            f"[Worker] payload.timeout={task_data['timeout']}s, "
+            f"ceiling={self.per_task_timeout_sec}s, "
+            f"effective={per_task_timeout_sec}s"
+        )
 
         result_data = await self.worker_pool.execute_task(
             task_data,

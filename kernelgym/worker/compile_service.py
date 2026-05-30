@@ -166,13 +166,8 @@ class CompileService:
         self.task_manager: Optional[TaskManager] = None
         self.pool: Optional[CompileOffloadPool] = None
         self.max_workers = max(1, int(getattr(settings, "compile_offload_workers", 8)))
-        self.timeout_sec = float(
-            getattr(settings, "compile_offload_timeout_sec", 180.0) or 180.0
-        )
-        self.artifact_ttl_sec = max(
-            300,
-            int(getattr(settings, "compile_offload_timeout_sec", 180.0) or 180.0) * 4,
-        )
+        self.timeout_sec = float(settings.default_timeout)
+        self.artifact_ttl_sec = max(300, int(self.timeout_sec) * 4)
         self._sem = asyncio.Semaphore(self.max_workers)
         self._in_flight: set[asyncio.Task] = set()
         self._stats = {
@@ -336,6 +331,9 @@ class CompileService:
         device_str = task_data.get("device") or "cuda:0"
         loop = asyncio.get_event_loop()
 
+        # End-to-end task budget = min(operator ceiling, client-requested).
+        compile_timeout = min(self.timeout_sec, float(task_data["timeout"]))
+
         # Wall-clock from the moment the task was popped off the compile
         # queue. ``elapsed_total`` includes:
         #   * waiting for a free pool slot (when WORKERS < concurrency)
@@ -360,7 +358,7 @@ class CompileService:
                 backend_name=backend_name,
                 backend_adapter=backend_adapter,
                 device_str=device_str,
-                timeout=self.timeout_sec,
+                timeout=compile_timeout,
             )
 
         try:
@@ -434,6 +432,21 @@ class CompileService:
             f"(nvcc={elapsed_nvcc:.2f}s, queue_wait={queue_wait:.2f}s) "
             f"at {build_dir}"
         )
+
+        remaining = max(0, int(compile_timeout - elapsed_total))
+        task_data["timeout"] = remaining
+        try:
+            await self.task_manager.redis.hset(
+                f"{self.task_manager.task_prefix}{task_id}",
+                "data",
+                json.dumps(task_data),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to write reduced timeout back to redis for {task_id}: {exc}; "
+                f"GPU stage will use the original payload timeout"
+            )
+
         await self._forward_to_gpu(task_data)
 
     async def _forward_to_gpu(self, task_data: Dict[str, Any]) -> None:

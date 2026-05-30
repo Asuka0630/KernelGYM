@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterator, Optional, Union
 import torch
 
 from kernelgym.config import settings
+from kernelgym.phase_state import enter_phase
 from kernelgym.toolkit.kernelbench import triton_detect as detect
 from kernelgym.toolkit.kernelbench.exec_types import KernelExecResult, get_error_name, set_seed
 from kernelgym.toolkit.kernelbench.loading import (
@@ -110,6 +111,7 @@ def _run_correctness_step(
     seed_num: int,
     device: Union[torch.device, int],
 ) -> KernelExecResult:
+    enter_phase("correctness")
     if verbose:
         print("[Eval] Checking Correctness")
     _phase_start = time.perf_counter()
@@ -208,6 +210,7 @@ def _run_performance_step(
     device: Union[torch.device, int],
     enable_profiling: bool,
 ):
+    enter_phase("performance")
     _perf_phase_start = time.perf_counter()
     try:
         _run_performance_step_impl(
@@ -519,6 +522,7 @@ def eval_kernel_against_ref(
         print("[Eval] Loading Original Model")
     _record_phase(metadata, "setup", time.perf_counter() - _setup_phase_start)
 
+    enter_phase("compile")
     _load_phase_start = time.perf_counter()
     with _timed(metadata, "load.original_model"):
         Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
@@ -917,6 +921,7 @@ def eval_reference_only(
 
     kernel_exec_result = KernelExecResult(compiled=True, correctness=True, metadata=metadata)
 
+    enter_phase("performance")
     _ref_perf_start = time.perf_counter()
     try:
         if verbose:

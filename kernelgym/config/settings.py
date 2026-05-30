@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     celery_timezone: str = Field(default="UTC", env="CELERY_TIMEZONE")
 
     default_num_trials: int = Field(default=100, env="DEFAULT_NUM_TRIALS")
+    # Operator-set wall-clock ceiling for a single evaluation task,
+    # covering the entire pipeline (nvcc compile + correctness + perf).
+    # When the client sends ``payload.timeout``, the effective timeout 
+    # is ``min(default_timeout, payload.timeout)``;
     default_timeout: int = Field(default=600, env="DEFAULT_TIMEOUT")
     default_backend: str = Field(default="triton", env="DEFAULT_BACKEND")
     default_toolkit: str = Field(default="kernelbench", env="DEFAULT_TOOLKIT")
@@ -144,14 +148,6 @@ class Settings(BaseSettings):
         description=(
             "Number of concurrent nvcc compilations in the off-load pool. "
             "Tune to match CPU/RAM headroom; 2x num_gpus is a good start."
-        ),
-    )
-    compile_offload_timeout_sec: float = Field(
-        default=300.0,
-        env="COMPILE_OFFLOAD_TIMEOUT_SEC",
-        description=(
-            "Hard wall-clock cap on a single off-loaded compile. On timeout "
-            "the task is marked compiled=False and never reaches the GPU."
         ),
     )
     compile_offload_build_root: str = Field(
