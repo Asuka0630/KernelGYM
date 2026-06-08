@@ -114,6 +114,9 @@ def _create_paired_tasks(
         run_correctness=task.run_correctness,
         run_triton_detection=task.run_triton_detection,
         run_performance=task.run_performance,
+        enable_ncu=task.enable_ncu,
+        ncu_top_k_rules=task.ncu_top_k_rules,
+        kernel_names=task.kernel_names,
         resources=task.resources,
     )
 

@@ -88,6 +88,41 @@ class Settings(BaseSettings):
         description="Retry count when profiler returns empty results (0 to disable).",
     )
 
+    # ------------------------------------------------------------------
+    # NCU (Nsight Compute) profiling — runs ``ncu --set <ncu_set>`` against
+    # custom CUDA kernels after correctness passes, attaches a structured
+    # summary (key metrics + Top-K rule suggestions) to the response
+    # under ``metadata.ncu``. Strictly opt-in per request via
+    # ``EvaluationRequest.enable_ncu`` (no global enable switch).
+    # ------------------------------------------------------------------
+    ncu_set: str = Field(
+        default="full",
+        env="NCU_SET",
+        description="Nsight Compute --set value (full | detailed | basic | source).",
+    )
+    ncu_timeout_sec: int = Field(
+        default=180,
+        env="NCU_TIMEOUT_SEC",
+        description="Wall-clock timeout for the ncu subprocess (seconds).",
+    )
+    ncu_top_k_rules: int = Field(
+        default=5,
+        env="NCU_TOP_K_RULES",
+        description="Top-K NCU rule suggestions (sorted by estimated speedup) attached to metadata.ncu.",
+    )
+    ncu_python_extra_paths: List[str] = Field(
+        default_factory=list,
+        env="NCU_PYTHON_EXTRA_PATHS",
+        description="Extra sys.path entries to locate the ncu_report Python module "
+                    "(e.g. /usr/local/cuda/nsight-compute-XXXX.X.X/extras/python).",
+    )
+    ncu_extra_cflags: List[str] = Field(
+        default_factory=lambda: ["-lineinfo"],
+        env="NCU_EXTRA_CFLAGS",
+        description="Extra nvcc cflags injected into torch load_inline when NCU is enabled "
+                    "(at minimum -lineinfo so source-level metrics map back to source).",
+    )
+
     reference_cache_dataset_path: str = Field(default="", env="REFERENCE_CACHE_DATASET_PATH")
     val_data_cache_dataset_path: str = Field(default="", env="VAL_DATA_CACHE_DATASET_PATH")
     enable_reference_cache: bool = Field(default=False, env="ENABLE_REFERENCE_CACHE")

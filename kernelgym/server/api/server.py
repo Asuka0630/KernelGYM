@@ -25,6 +25,7 @@ from .models import (
     ErrorResponse,
     WorkflowRequest,
     WorkflowResponse,
+    DeviceInfoResponse,
 )
 from .utils import get_system_health, get_system_metrics, format_timestamp
 from kernelgym.server.task_manager import TaskManager
@@ -687,6 +688,65 @@ async def cancel_task(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to cancel task: {str(e)}"
         )
+
+
+_DTYPE_TO_PREFIX: Dict[str, str] = {
+    "float32": "f32",
+    "fp32": "f32",
+    "tf32": "f32",
+    "float16": "f16",
+    "fp16": "f16",
+    "bfloat16": "f16",
+    "bf16": "f16",
+}
+
+
+@app.get("/device_info", response_model=DeviceInfoResponse)
+async def get_device_info(device_index: int = 0, dtype: Optional[str] = None):
+    """Return target GPU specs (SM count, shared mem, peak bandwidth, etc).
+
+    LRU-cached so repeated calls are nearly free. Used by STARK to render
+    a hardware description block into every Plan/Code/Debug agent's
+    system prompt.
+
+    When ``dtype`` is provided, ``peak_tflops`` is filtered to only the
+    matching cuda_core + tensor_core pair for that precision.
+    """
+    try:
+        from kernelgym.toolkit.device_info import get_device_info_cached
+
+        info = get_device_info_cached(device_index)
+        info = dict(info)  # shallow copy — don't mutate the lru_cache entry
+        info.setdefault("device_index", device_index)
+
+        if dtype is not None:
+            prefix = _DTYPE_TO_PREFIX.get(dtype.lower())
+            if prefix is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported dtype '{dtype}'. "
+                    f"Supported: {sorted(_DTYPE_TO_PREFIX.keys())}",
+                )
+            info["peak_tflops"] = {
+                k: v
+                for k, v in info["peak_tflops"].items()
+                if k.startswith(prefix)
+            }
+            # Bypass response_model so Pydantic doesn't fill
+            # non-matching peak_tflops keys back from defaults.
+            return JSONResponse(content=info)
+
+        return DeviceInfoResponse(**info)
+    except RuntimeError as e:
+        # CUDA unavailable on this host — surface as 503 so the client
+        # can degrade gracefully (omit hardware block from prompt).
+        logger.warning(f"/device_info: CUDA unavailable: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
+    except IndexError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"/device_info: unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health", response_model=SystemHealthResponse)

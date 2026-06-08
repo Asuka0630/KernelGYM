@@ -153,6 +153,13 @@ class KernelBenchToolkit(Toolkit):
                 backend_adapter=backend_adapter,
                 build_dir=attached_build_dir,
                 precompiled_artifact=precompiled_artifact,
+                enable_ncu=bool(task.enable_ncu),
+                ncu_top_k_rules=int(
+                    task.ncu_top_k_rules
+                    if task.ncu_top_k_rules is not None
+                    else settings.ncu_top_k_rules
+                ),
+                kernel_names=task.kernel_names,
             )
 
             if not run_correctness:
@@ -338,6 +345,13 @@ class KernelBenchToolkit(Toolkit):
                 backend_adapter=backend_adapter,
                 build_dir=attached_build_dir,
                 precompiled_artifact=precompiled_artifact,
+                enable_ncu=bool(task.enable_ncu),
+                ncu_top_k_rules=int(
+                    task.ncu_top_k_rules
+                    if task.ncu_top_k_rules is not None
+                    else settings.ncu_top_k_rules
+                ),
+                kernel_names=task.kernel_names,
             )
 
             if not run_correctness:

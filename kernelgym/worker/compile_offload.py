@@ -92,6 +92,7 @@ def _compile_in_worker(
     backend_adapter: str,
     build_dir: str,
     device_str: str,
+    extra_cuda_cflags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run ``backend.compile`` for a kernel source in a CPU-only worker.
 
@@ -133,6 +134,7 @@ def _compile_in_worker(
             backend=backend_name,
             entry_point=entry_point,
             build_dir=build_dir,
+            extra_cuda_cflags=list(extra_cuda_cflags or []) or None,
         )
         if not isinstance(artifact, dict):
             artifact = {
@@ -226,6 +228,7 @@ class CompileOffloadPool:
         backend_adapter: str = "kernelbench",
         device_str: str = "cuda:0",
         timeout: Optional[float] = None,
+        extra_cuda_cflags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Synchronously off-load compilation to a CPU worker.
 
@@ -253,6 +256,11 @@ class CompileOffloadPool:
             ``backend.load()`` -- not used during compile itself.
         timeout : float, optional
             Hard wall-clock cap; on timeout returns ``compiled=False``.
+        extra_cuda_cflags : list[str], optional
+            Extra nvcc flags (e.g. ``["-lineinfo"]``) forwarded to
+            ``backend.compile`` and injected into ``load_inline`` inside
+            ``load_custom_model`` via a local patch. Required when the
+            kernel will subsequently be profiled with NCU.
         """
 
         if not code:
@@ -277,6 +285,7 @@ class CompileOffloadPool:
                         backend_adapter=backend_adapter,
                         build_dir=build_dir,
                         device_str=device_str,
+                        extra_cuda_cflags=extra_cuda_cflags,
                     )
                 except (RuntimeError, BrokenPipeError) as exc:
                     return self._fail(

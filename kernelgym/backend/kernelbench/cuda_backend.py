@@ -22,6 +22,7 @@ class KernelBenchCudaBackend(KernelBenchBackendBase):
         entry_point = kwargs.get("entry_point", "ModelNew")
         backend = kwargs.get("backend", "cuda")
         build_dir = kwargs.get("build_dir")
+        extra_cuda_cflags = kwargs.get("extra_cuda_cflags")
 
         valid, error = validate_code(code, entry_point)
         if not valid:
@@ -51,7 +52,12 @@ class KernelBenchCudaBackend(KernelBenchBackendBase):
             build_dir = tempfile.mkdtemp(prefix="kernelgym_cuda_")
 
         os.environ["TORCH_USE_CUDA_DSA"] = "1"
-        cache_result = build_compile_cache(code, build_dir, verbose=False)
+        cache_result = build_compile_cache(
+            code,
+            build_dir,
+            verbose=False,
+            extra_cuda_cflags=extra_cuda_cflags,
+        )
         artifact = {
             "compiled": cache_result["compiled"],
             "error": cache_result.get("error"),
