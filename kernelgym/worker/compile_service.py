@@ -343,6 +343,13 @@ class CompileService:
         # nvcc-only number; the difference is queue / IPC overhead and is
         # surfaced separately as ``compile_offload_queue_wait`` so the
         # bench summary can attribute slowdowns correctly.
+        # Resolve extra nvcc flags for NCU (e.g. -lineinfo).
+        ncu_extra_cflags = None
+        if task_data.get("enable_ncu"):
+            ncu_extra_cflags = list(
+                getattr(settings, "ncu_extra_cflags", None) or ["-lineinfo"]
+            )
+
         started = loop.time()
         self._stats["submitted"] += 1
 
@@ -359,6 +366,7 @@ class CompileService:
                 backend_adapter=backend_adapter,
                 device_str=device_str,
                 timeout=compile_timeout,
+                extra_cuda_cflags=ncu_extra_cflags,
             )
 
         try:

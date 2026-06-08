@@ -7,7 +7,7 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from kernelgym.utils.traceback_utils import (
     capture_compile_error,
@@ -460,6 +460,168 @@ def _run_performance_step_impl(
             print(f"[Eval] Error in Measuring Performance: {e}")
         kernel_exec_result.metadata["error_during_performance"] = capture_runtime_error(e)
 
+
+def _run_ncu_step(
+    *,
+    metadata: Dict[str, Any],
+    kernel_exec_result: "KernelExecResult",
+    original_model_src: str,
+    artifact: dict,
+    backend_adapter_name: str = "kernelbench",
+    kernel_names: Optional[List[str]],
+    ncu_top_k_rules: int,
+    seed_num: int,
+    device: Union[torch.device, int],
+    verbose: bool,
+) -> None:
+    """Profile the custom kernel(s) with Nsight Compute.
+
+    Writes ``metadata['ncu']`` and accumulates phase timing into
+    ``metadata['phase_timings_ms']['ncu']`` / ``ncu.parse``. All failure
+    modes downgrade to ``ncu_warning`` strings (the eval result's
+    correctness/perf fields are never affected).
+
+    The harness reuses the backend adapter (``backend.load(artifact)`` →
+    ``create_model()``) — exactly the same path as the main eval pipeline
+    — so no redundant compilation occurs.
+    """
+    import tempfile
+
+    from kernelgym.toolkit.kernel_names import (
+        build_kernel_regex,
+        extract_global_kernel_names,
+    )
+    from kernelgym.toolkit.kernelbench.ncu_runner import (
+        build_harness_files,
+        locate_ncu_binary,
+        run_ncu,
+    )
+    from kernelgym.toolkit.kernelbench.ncu_summary import summarize_report
+    from kernelgym.config import settings as _ncu_settings
+
+    enter_phase("ncu")
+    _ncu_phase_start = time.perf_counter()
+
+    # Normalise ``device`` to an integer index (ncu pins via CUDA_VISIBLE_DEVICES).
+    if isinstance(device, torch.device):
+        device_index = device.index if device.index is not None else 0
+    else:
+        device_index = int(device or 0)
+
+    # Resolve the kernel-name list: prefer caller-supplied, fall back to
+    # extraction from the artifact's kernel source.
+    _custom_src = artifact.get("code") or ""
+    names = list(kernel_names) if kernel_names else []
+    if not names:
+        names = extract_global_kernel_names(_custom_src)
+    # Surface the resolved name list on both the pipeline-local metadata
+    # (used by phase timers) and the kernel_exec_result metadata (which
+    # is what eventually flows back to the API client). Pydantic's
+    # ``BaseModel`` may copy the dict on construction, so the two are
+    # not guaranteed to be the same reference.
+    metadata.setdefault("ncu_kernel_names", names)
+    if isinstance(kernel_exec_result.metadata, dict):
+        kernel_exec_result.metadata.setdefault("ncu_kernel_names", names)
+    ncu_kernel_source_name = "custom_model_src"
+    if not names:
+        ncu_summary: Dict[str, Any] = {
+            "kernels": [],
+            "report_path": None,
+            "ncu_warning": f"no __global__ kernel names found in {ncu_kernel_source_name}",
+        }
+        metadata["ncu"] = ncu_summary
+        if isinstance(kernel_exec_result.metadata, dict):
+            kernel_exec_result.metadata["ncu"] = ncu_summary
+        _record_phase(metadata, "ncu", time.perf_counter() - _ncu_phase_start)
+        return
+
+    kernel_regex = build_kernel_regex(names)
+
+    # Render harness + state.pkl into a per-eval temp dir.
+    with tempfile.TemporaryDirectory(prefix="stark_ncu_") as _tmpdir_str:
+        from pathlib import Path
+        tmpdir = Path(_tmpdir_str)
+
+        try:
+            harness_path, state_path = build_harness_files(
+                tmpdir=tmpdir,
+                reference_code=original_model_src,
+                artifact=artifact,
+                backend_adapter_name=backend_adapter_name,
+                seed=seed_num,
+                # NCU itself replays each kernel ~50 times to collect every
+                # metric group, so application-level warmup is redundant
+                # and would just inflate the launch count NCU has to filter.
+                warmup_iters=0,
+            )
+        except Exception as e:  # noqa: BLE001
+            ncu_summary = {
+                "kernels": [],
+                "report_path": None,
+                "ncu_warning": f"harness build failed: {e}",
+            }
+            metadata["ncu"] = ncu_summary
+            if isinstance(kernel_exec_result.metadata, dict):
+                kernel_exec_result.metadata["ncu"] = ncu_summary
+            _record_phase(metadata, "ncu", time.perf_counter() - _ncu_phase_start)
+            return
+
+        report_path = tmpdir / "report.ncu-rep"
+
+        ok, warning, ncu_details = run_ncu(
+            harness_path=harness_path,
+            state_path=state_path,
+            report_path=report_path,
+            kernel_regex=kernel_regex,
+            device_index=device_index,
+            timeout_sec=int(getattr(_ncu_settings, "ncu_timeout_sec", 180)),
+            ncu_set=str(getattr(_ncu_settings, "ncu_set", "full")),
+            # NCU's ``-c`` is a process-wide launch counter, not per-kernel,
+            # so we need at least ``len(names)`` slots to capture each
+            # ``__global__`` once.
+            launch_count=len(names),
+        )
+        metadata.setdefault("ncu_subprocess", ncu_details)
+
+        if not ok:
+            ncu_summary = {
+                "kernels": [],
+                "report_path": str(report_path),
+                "ncu_warning": warning,
+            }
+            metadata["ncu"] = ncu_summary
+            if isinstance(kernel_exec_result.metadata, dict):
+                kernel_exec_result.metadata["ncu"] = ncu_summary
+            _record_phase(metadata, "ncu", time.perf_counter() - _ncu_phase_start)
+            return
+
+        # Parse the report (subject to its own phase timer).
+        _parse_start = time.perf_counter()
+        try:
+            ncu_summary = summarize_report(
+                str(report_path),
+                top_k_rules=int(ncu_top_k_rules),
+                ncu_binary=locate_ncu_binary(),
+            )
+        except Exception as e:  # noqa: BLE001
+            ncu_summary = {
+                "kernels": [],
+                "report_path": str(report_path),
+                "ncu_warning": f"summarize_report failed: {e}",
+            }
+        _record_phase(metadata, "ncu.parse", time.perf_counter() - _parse_start)
+
+    metadata["ncu"] = ncu_summary
+    if isinstance(kernel_exec_result.metadata, dict):
+        kernel_exec_result.metadata["ncu"] = ncu_summary
+
+    if verbose:
+        n_kernels = len(ncu_summary.get("kernels", []))
+        print(f"[NCU] summary: {n_kernels} kernel(s), warning={ncu_summary.get('ncu_warning')}")
+
+    _record_phase(metadata, "ncu", time.perf_counter() - _ncu_phase_start)
+
+
 def eval_kernel_against_ref(
     original_model_src: str,
     custom_model_src: str,
@@ -479,6 +641,9 @@ def eval_kernel_against_ref(
     enable_triton_detection: bool = True,
     backend_adapter: Optional[Any] = None,
     precompiled_artifact: Optional[Dict[str, Any]] = None,
+    enable_ncu: bool = False,
+    ncu_top_k_rules: int = 5,
+    kernel_names: Optional[List[str]] = None,
 ) -> KernelExecResult:
     """Evaluate a custom kernel against a reference model.
 
@@ -494,7 +659,64 @@ def eval_kernel_against_ref(
         full nvcc compile.
 
         Cuda backend only. Triton/legacy paths ignore this argument.
+    enable_ncu : bool, default False
+        When True (and correctness passes), runs Nsight Compute against
+        the custom ``__global__`` kernels (filtered by ``kernel_names``)
+        and attaches the structured summary under ``metadata['ncu']``.
+        The cflag injection that NCU source-level metrics depend on
+        (e.g. ``-lineinfo``) is handled at compile time by
+        ``load_custom_model``; no in-process patching is needed here.
+    ncu_top_k_rules : int, default 5
+        Top-K NCU rule suggestions per kernel (sorted by estimated speedup).
+    kernel_names : list[str] or None
+        Explicit kernel-name list for the ``ncu -k 'regex:...'`` filter.
+        When None, the function falls back to extracting names from
+        ``custom_model_src`` via ``extract_global_kernel_names``.
     """
+    return _eval_kernel_against_ref_impl(
+        original_model_src=original_model_src,
+        custom_model_src=custom_model_src,
+        seed_num=seed_num,
+        num_correct_trials=num_correct_trials,
+        num_perf_trials=num_perf_trials,
+        num_warmup=num_warmup,
+        verbose=verbose,
+        measure_performance=measure_performance,
+        build_dir=build_dir,
+        device=device,
+        backend=backend,
+        entry_point=entry_point,
+        enable_profiling=enable_profiling,
+        enable_triton_detection=enable_triton_detection,
+        backend_adapter=backend_adapter,
+        precompiled_artifact=precompiled_artifact,
+        enable_ncu=enable_ncu,
+        ncu_top_k_rules=ncu_top_k_rules,
+        kernel_names=kernel_names,
+    )
+
+
+def _eval_kernel_against_ref_impl(
+    original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    num_correct_trials: int = 1,
+    num_perf_trials: int = 10,
+    num_warmup: int = 3,
+    verbose: bool = True,
+    measure_performance: bool = True,
+    build_dir: os.PathLike = None,
+    device: Union[torch.device, int] = None,
+    backend: str = "cuda",
+    entry_point: str = "Model",
+    enable_profiling: bool = True,
+    enable_triton_detection: bool = True,
+    backend_adapter: Optional[Any] = None,
+    precompiled_artifact: Optional[Dict[str, Any]] = None,
+    enable_ncu: bool = False,
+    ncu_top_k_rules: int = 5,
+    kernel_names: Optional[List[str]] = None,
+) -> KernelExecResult:
     _total_phase_start = time.perf_counter()
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
     metadata: Dict[str, Any] = {}
@@ -691,7 +913,21 @@ def eval_kernel_against_ref(
                         if verbose:
                             print("[Eval] Model with Triton Loaded")
                     else:
-                        ModelNew = load_custom_model(custom_model_src, context, build_dir)
+                        # NCU profiling needs source-line info baked into
+                        # the .so; resolve cflags from settings only when
+                        # the caller actually requested NCU.
+                        _inproc_cflags: Optional[List[str]] = None
+                        if enable_ncu:
+                            _inproc_cflags = list(
+                                getattr(settings, "ncu_extra_cflags", None)
+                                or ["-lineinfo"]
+                            )
+                        ModelNew = load_custom_model(
+                            custom_model_src,
+                            context,
+                            build_dir,
+                            extra_cuda_cflags=_inproc_cflags,
+                        )
                 finally:
                     sys.stdout.flush()
                     sys.stderr.flush()
@@ -833,6 +1069,17 @@ def eval_kernel_against_ref(
         _record_phase(metadata, "total", time.perf_counter() - _total_phase_start)
         return kernel_exec_result
 
+    # For CUDA (non-Triton) backends, Triton detection won't find __global__
+    # kernel names. Extract them from source so the profiling coverage step
+    # can distinguish custom kernels from framework kernels.
+    if not is_triton and not metadata.get("triton_profiler_matches"):
+        from kernelgym.toolkit.kernel_names import extract_global_kernel_names
+        cuda_names = extract_global_kernel_names(custom_model_src)
+        if cuda_names:
+            metadata["triton_profiler_matches"] = cuda_names
+            if verbose:
+                print(f"[Eval] CUDA kernel names from source: {cuda_names}")
+
     if measure_performance:
         _run_performance_step(
             kernel_exec_result=kernel_exec_result,
@@ -845,6 +1092,44 @@ def eval_kernel_against_ref(
             seed_num=seed_num,
             device=device,
             enable_profiling=enable_profiling,
+        )
+
+    # NCU profiling — runs in a fresh subprocess so it can't pollute
+    # ``performance.measure`` timings. Strictly opt-in: only when
+    # ``enable_ncu`` is True AND correctness passed.
+    if enable_ncu and kernel_exec_result and kernel_exec_result.correctness:
+        # Build an artifact dict the harness can feed to backend.load().
+        # Prefer the compile-server artifact (which carries build_dir and
+        # code); fall back to the in-process compile path.
+        _kernel_entry_point = f"{entry_point}New"
+        _ncu_artifact: Dict[str, Any]
+        if isinstance(precompiled_artifact, dict) and precompiled_artifact.get("compiled"):
+            _ncu_artifact = dict(precompiled_artifact)
+            if not _ncu_artifact.get("code"):
+                _ncu_artifact["code"] = custom_model_src
+            _ncu_artifact.setdefault("entry_point", _kernel_entry_point)
+            _ncu_artifact.setdefault("backend", backend)
+            _ncu_artifact.setdefault("device", str(device))
+        else:
+            _ncu_artifact = {
+                "code": custom_model_src,
+                "build_dir": build_dir,
+                "entry_point": _kernel_entry_point,
+                "backend": backend,
+                "device": str(device),
+                "compiled": True,
+            }
+        _run_ncu_step(
+            metadata=metadata,
+            kernel_exec_result=kernel_exec_result,
+            original_model_src=original_model_src,
+            artifact=_ncu_artifact,
+            backend_adapter_name="kernelbench",
+            kernel_names=kernel_names,
+            ncu_top_k_rules=ncu_top_k_rules,
+            seed_num=seed_num,
+            device=device,
+            verbose=verbose,
         )
 
     _record_memory_peak(metadata, device, kernel_exec_result)

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -34,6 +34,10 @@ class EvaluationTask:
     run_triton_detection: Optional[bool] = None
     run_performance: Optional[bool] = None
     skip_reference: bool = False
+    # NCU profiling settings
+    enable_ncu: Optional[bool] = None
+    ncu_top_k_rules: Optional[int] = 5
+    kernel_names: Optional[List[str]] = None
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -97,6 +101,9 @@ class KernelEvaluationTask:
     run_correctness: Optional[bool] = None
     run_triton_detection: Optional[bool] = None
     run_performance: Optional[bool] = None
+    enable_ncu: Optional[bool] = None
+    ncu_top_k_rules: Optional[int] = 5
+    kernel_names: Optional[List[str]] = None
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:

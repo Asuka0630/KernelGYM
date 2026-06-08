@@ -104,6 +104,16 @@ class KernelBenchWorkflowController(WorkflowController):
         if enable_profiling is None:
             enable_profiling = settings.enable_profiling
         kernel_payload["enable_profiling"] = enable_profiling
+
+        # NCU profiling — strictly per-request opt-in.
+        kernel_payload["enable_ncu"] = bool(eval_task.enable_ncu)
+        kernel_payload["ncu_top_k_rules"] = (
+            eval_task.ncu_top_k_rules
+            if eval_task.ncu_top_k_rules is not None
+            else settings.ncu_top_k_rules
+        )
+        if eval_task.kernel_names is not None:
+            kernel_payload["kernel_names"] = list(eval_task.kernel_names)
         kernel_task_spec = TaskSpec(
             kind="kernelbench.kernel",
             payload=kernel_payload,
