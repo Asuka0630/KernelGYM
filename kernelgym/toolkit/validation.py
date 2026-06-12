@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 from kernelgym.common import ErrorCode
+from kernelgym.utils.traceback_utils import capture_compile_error, compile_with_source
 
 
 def validate_code(code: str, entry_point: str = "Model") -> Tuple[bool, str]:
@@ -32,9 +33,9 @@ def early_kernel_validation(
             return False, error_msg, ErrorCode.VALIDATION_ERROR
 
         try:
-            compile(kernel_code, "<string>", "exec")
+            compile_with_source(kernel_code, "<string>", "exec")
         except SyntaxError as e:
-            return False, f"Syntax error in kernel code: {str(e)}", ErrorCode.SYNTAX_ERROR
+            return False, capture_compile_error(e), ErrorCode.SYNTAX_ERROR
 
         if backend == "triton":
             required_imports = ["import triton", "from triton import"]
@@ -74,7 +75,7 @@ def early_kernel_validation(
             except Exception as e:
                 raise RuntimeError(f"Failed to instantiate {kernel_entry_point}: {{e}}")
             """
-            compile(test_code, "<test>", "exec")
+            compile_with_source(test_code, "<test>", "exec")
         except Exception as e:
             error_str = str(e)
             if "Failed to instantiate" in error_str:

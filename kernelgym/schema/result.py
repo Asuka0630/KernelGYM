@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import traceback
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional
 
@@ -46,7 +45,7 @@ class ReferenceTimingResult:
 class KernelEvaluationResult:
     task_id: str
     base_task_id: str
-    compiled: bool
+    compiled: Optional[bool]
     correctness: Optional[bool]
     decoy_kernel: bool
     kernel_runtime: float
@@ -75,15 +74,19 @@ class KernelEvaluationResult:
         task_id: str,
         base_task_id: str,
         result: KernelExecResult,
-        verbose_errors: bool = True,
     ) -> "KernelEvaluationResult":
         metadata: Dict[str, Any] = dict(result.metadata or {})
 
+        # All upstream call sites now pass strings into ``metadata``
+        # (see kernelgym.utils.traceback_utils.capture_compile_error /
+        # capture_runtime_error).  Defensive coercion only handles the
+        # rare case where a non-string slipped through.
         for key in (
             "compilation_error",
             "runtime_error",
             "error",
             "correctness_issue",
+            "error_during_performance",
             "triton_kernel_coverage",
             "num_custom_kernels",
             "num_total_kernels",
@@ -92,45 +95,50 @@ class KernelEvaluationResult:
             "total_kernel_run_time_in_profiling_us",
             "custom_kernel_cuda_time_coverage",
         ):
-            if key in metadata and metadata[key] is not None and not isinstance(
-                metadata[key], (str, int, float, bool)
-            ):
-                if isinstance(metadata[key], BaseException):
-                    if verbose_errors:
-                        if metadata[key].__traceback__:
-                            metadata[key] = "".join(
-                                traceback.format_exception(
-                                    type(metadata[key]),
-                                    metadata[key],
-                                    metadata[key].__traceback__,
-                                )
-                            )
-                        else:
-                            metadata[key] = (
-                                f"{type(metadata[key]).__name__}: {str(metadata[key])}"
-                            )
-                    else:
-                        metadata[key] = str(metadata[key])
-                else:
-                    metadata[key] = str(metadata[key])
+            value = metadata.get(key)
+            if value is None or isinstance(value, (str, int, float, bool)):
+                continue
+            metadata[key] = str(value)
 
         error_message: Optional[str] = None
         error_code: Optional[ErrorCode] = None
 
         if not result.compiled:
-            detail = metadata.get("compilation_error") or metadata.get("error") or metadata.get(
-                "validation_error"
+            detail = (
+                metadata.get("compilation_error")
+                or metadata.get("error")
+                or metadata.get("validation_error")
             )
             if detail:
                 error_message = f"Kernel compilation failed: {detail}"
             else:
                 error_message = "Kernel compilation failed"
-            error_code = ErrorCode.COMPILATION_ERROR
+            # Distinguish "nvcc/build wedged past the budget" (compile
+            # offload pool returned with a TimeoutError) from "code is
+            # syntactically broken" so downstream agents can react
+            # appropriately.
+            detail_str = str(detail).lower() if detail else ""
+            if "timeout" in detail_str or "timed out" in detail_str:
+                error_code = ErrorCode.COMPILATION_TIMEOUT
+            else:
+                error_code = ErrorCode.COMPILATION_ERROR
         elif not result.correctness:
-            detail = metadata.get("runtime_error") or metadata.get("error")
-            if detail:
-                error_message = f"Kernel execution failed: {detail}"
+            # Distinguish "kernel raised at runtime" from "kernel returned
+            # numerically wrong output". The former carries an exception
+            # detail in ``runtime_error`` / ``error``; the latter carries
+            # the diff summary in ``correctness_issue`` (e.g.
+            # "Output mismatch; max_difference=[...]"). Surface whichever
+            # one is populated so the LLM agent gets the actionable
+            # detail directly from ``error_message`` without having to
+            # reach into ``metadata``.
+            runtime_detail = metadata.get("runtime_error") or metadata.get("error")
+            correctness_detail = metadata.get("correctness_issue")
+            if runtime_detail:
+                error_message = f"Kernel execution failed: {runtime_detail}"
                 error_code = ErrorCode.RUNTIME_ERROR
+            elif correctness_detail:
+                error_message = f"Kernel produced incorrect results: {correctness_detail}"
+                error_code = ErrorCode.CORRECTNESS_ERROR
             else:
                 error_message = "Kernel produced incorrect results"
                 error_code = ErrorCode.CORRECTNESS_ERROR
@@ -140,7 +148,10 @@ class KernelEvaluationResult:
             base_task_id=base_task_id,
             compiled=result.compiled,
             decoy_kernel=result.decoy_kernel,
-            correctness=result.correctness,
+            # When the kernel never compiled, correctness was never even
+            # attempted -- surface that as None (unknown), not False, so
+            # the downstream client can distinguish "skipped" from "failed".
+            correctness=result.correctness if result.compiled else None,
             kernel_runtime=result.runtime,
             metadata=metadata,
             status="completed" if result.compiled else "failed",
@@ -152,8 +163,8 @@ class KernelEvaluationResult:
 @dataclass
 class EvaluationResult:
     task_id: str
-    compiled: bool
-    correctness: bool
+    compiled: Optional[bool]
+    correctness: Optional[bool]
     decoy_kernel: bool
     reference_runtime: float
     kernel_runtime: float

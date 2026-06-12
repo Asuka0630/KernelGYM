@@ -18,6 +18,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional
 
+from kernelgym.utils.traceback_utils import capture_compile_error
+
 logger = logging.getLogger("kernelgym.compile_offload")
 
 
@@ -144,9 +146,10 @@ def _compile_in_worker(
         artifact["elapsed_sec"] = time.perf_counter() - started
         return artifact
     except BaseException as exc:  # noqa: BLE001 - boundary-crossing safeguard.
+        _error = capture_compile_error(exc)
         return {
             "compiled": False,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _error,
             "build_dir": build_dir,
             "entry_point": entry_point,
             "backend": backend_name,

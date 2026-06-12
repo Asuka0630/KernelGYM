@@ -19,13 +19,25 @@ import time
 import logging
 import traceback
 import multiprocessing as mp
+
+from kernelgym.utils.traceback_utils import format_user_traceback
 import queue
 import asyncio
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from datetime import datetime
 
+from kernelgym import phase_state
+
 logger = logging.getLogger("kernelgym.subprocess_pool")
+
+
+class CompilationTimeoutError(TimeoutError):
+    """Subprocess was killed while still compiling the candidate kernel."""
+
+
+class RuntimeTimeoutError(TimeoutError):
+    """Subprocess was killed during correctness check or perf measurement."""
 
 
 def _aggressive_gpu_cleanup(device_id: int):
@@ -126,6 +138,11 @@ class PersistentWorker:
         self.ctx = mp.get_context('spawn')
         self.task_queue = self.ctx.Queue(maxsize=10)  # 限制队列大小，避免内存爆炸
         self.result_queue = self.ctx.Queue(maxsize=10)
+        # Shared int that the worker subprocess updates whenever it enters a
+        # new pipeline phase (compile / correctness / performance). Read by
+        # this parent process when the task wall-clock budget expires, so we
+        # can classify the timeout into COMPILATION_TIMEOUT vs RUNTIME_TIMEOUT.
+        self.phase_state = self.ctx.Value('i', phase_state.PHASE_IDLE, lock=False)
 
         self.is_alive_flag = True
         self.tasks_processed = 0
@@ -147,7 +164,8 @@ class PersistentWorker:
                 self.worker_id,
                 self.device_id,
                 self.task_queue,
-                self.result_queue
+                self.result_queue,
+                self.phase_state,
             ),
             daemon=False  # 不使用 daemon，确保可以正常清理
         )
@@ -190,6 +208,10 @@ class PersistentWorker:
         if not self.is_alive():
             raise RuntimeError(f"[{self.worker_id}] Worker is not alive")
 
+        # Reset phase before dispatching so a stale value from a previous task
+        # cannot confuse the timeout classifier.
+        self.phase_state.value = phase_state.PHASE_IDLE
+
         # 发送任务
         try:
             self.task_queue.put(task_data, timeout=5)
@@ -225,16 +247,31 @@ class PersistentWorker:
             return result
 
         except queue.Empty:
-            # 超时
+            # 超时：根据 phase_state 区分编译超时 vs 运行超时
+            phase_code = int(self.phase_state.value)
+            phase = phase_state.phase_name(phase_code)
+            task_id = task_data.get('task_id', 'unknown')
             logger.error(
                 f"[{self.worker_id}] Task timeout after {timeout}s, "
-                f"task_id={task_data.get('task_id', 'unknown')}"
+                f"task_id={task_id}, phase={phase}"
             )
             # 标记 worker 为不可用（可能卡死了）
             self.is_alive_flag = False
-            raise TimeoutError(
-                f"[{self.worker_id}] Task {task_data.get('task_id', 'unknown')} "
-                f"timeout after {timeout}s"
+            if phase_code == phase_state.PHASE_COMPILE:
+                raise CompilationTimeoutError(
+                    f"[{self.worker_id}] Task {task_id} compilation timeout "
+                    f"after {timeout}s (phase={phase})"
+                )
+            # IDLE / CORRECTNESS / PERFORMANCE all map to runtime timeout: by
+            # the time we're past PHASE_COMPILE the kernel already compiled
+            # and any further hang is execution-side. PHASE_IDLE means the
+            # subprocess never reported a phase before the budget expired,
+            # which in practice only happens during hand-off / IPC wedges --
+            # treat as runtime to be safe (compile failures are surfaced via
+            # the toolkit return value, not a wall-clock kill).
+            raise RuntimeTimeoutError(
+                f"[{self.worker_id}] Task {task_id} runtime timeout "
+                f"after {timeout}s (phase={phase})"
             )
 
     def is_alive(self) -> bool:
@@ -423,14 +460,15 @@ class SubprocessWorkerPool:
                 )
                 last_error = e
 
-                # Check if this is a timeout error
-                error_msg = str(e)
-                if "timeout" in error_msg.lower() or "Task timeout after" in error_msg:
+                # Check if this is a timeout error (phase already encoded in
+                # the exception type by PersistentWorker.execute_task).
+                if isinstance(e, (CompilationTimeoutError, RuntimeTimeoutError)):
                     is_timeout_error = True
                     task_id = task_data.get("task_id", "unknown")
                     logger.warning(
                         f"[{worker.worker_id}] Task {task_id} timeout detected "
-                        f"(timeout={timeout}s) - will NOT retry to avoid blocking queue"
+                        f"(kind={type(e).__name__}, timeout={timeout}s) - "
+                        f"will NOT retry to avoid blocking queue"
                     )
 
                 # 尝试重启 worker
@@ -453,11 +491,11 @@ class SubprocessWorkerPool:
 
         # Failed after all retries (or timeout)
         if is_timeout_error:
-            task_id = task_data.get("task_id", "unknown")
-            raise TimeoutError(
-                f"[GPU {self.device_id}] Task {task_id} timeout after {timeout}s. "
-                f"Not retried to avoid blocking worker queue."
-            )
+            # Re-raise the original CompilationTimeoutError /
+            # RuntimeTimeoutError so the upper layer (gpu_worker) can branch
+            # on the exception type and emit the right ErrorCode.
+            assert isinstance(last_error, (CompilationTimeoutError, RuntimeTimeoutError))
+            raise last_error
         else:
             raise RuntimeError(
                 f"[GPU {self.device_id}] Task failed after {max_retries} retries. "
@@ -631,16 +669,18 @@ def _persistent_worker_loop(
     worker_id: str,
     device_id: int,
     task_queue: mp.Queue,
-    result_queue: mp.Queue
+    result_queue: mp.Queue,
+    phase_state_value
 ):
     """
     持久化 worker 的主循环
 
     这个函数在 subprocess 中运行：
     1. 启动时一次性初始化 torch 和 CUDA
-    2. 循环处理任务
-    3. **遇到 CUDA error 立即退出**
-    4. 每次任务后清理 GPU 内存
+    2. 安装 phase 上报钩子，让 toolkit 阶段切换写入共享内存
+    3. 循环处理任务
+    4. **遇到 CUDA error 立即退出**
+    5. 每次任务后清理 GPU 内存
     """
     init_start = time.time()
 
@@ -654,6 +694,18 @@ def _persistent_worker_loop(
         import torch.cuda
         from kernelgym.backend import get_backend
         from kernelgym.toolkit import get_toolkit
+
+        # 安装 phase 上报钩子：toolkit pipeline 在每个阶段切换时调用
+        # `phase_state.enter_phase(name)`，钩子把 phase code 写到父进程
+        # 共享的 mp.Value 上。父进程在任务超时时读取此值来区分
+        # COMPILATION_TIMEOUT vs RUNTIME_TIMEOUT。
+        def _phase_reporter(code: int) -> None:
+            try:
+                phase_state_value.value = int(code)
+            except Exception:
+                pass
+
+        phase_state.set_reporter(_phase_reporter)
 
         # 初始化 CUDA
         torch.cuda.init()
@@ -749,11 +801,12 @@ def _persistent_worker_loop(
                     )
 
                     # 返回错误结果，并标记 worker 将退出
+                    _user_tb = format_user_traceback()
                     result_queue.put({
                         "success": False,
                         "error_type": error_type,
                         "error_message": error_message,
-                        "traceback": traceback.format_exc(),
+                        "traceback": _user_tb,
                         "worker_exiting": True,  # 关键标记！
                         "cuda_error": is_cuda_error,
                         "profiling_error": is_profiler_error
@@ -784,11 +837,12 @@ def _persistent_worker_loop(
                         file=sys.stderr
                     )
 
+                    _user_tb = format_user_traceback()
                     result_queue.put({
                         "success": False,
                         "error_type": error_type,
                         "error_message": error_message,
-                        "traceback": traceback.format_exc(),
+                        "traceback": _user_tb,
                         "worker_exiting": False,
                         "cuda_error": False
                     })
@@ -891,16 +945,24 @@ def _execute_task_in_worker(
         if isinstance(result, dict):
             status = result.get("status")
             error_msg = result.get("error_message")
+            error_code = result.get("error_code")
         else:
             status = getattr(result, "status", None)
             error_msg = getattr(result, "error_message", None)
+            error_code = getattr(result, "error_code", None)
 
-        if status == "failed" and error_msg:
+        # Only treat truly poisoning runtime CUDA errors (illegal memory
+        # access, device-side asserts) as worker-fatal.
+        is_compile_failure = (
+            (isinstance(error_code, str) and "COMPILATION" in error_code.upper())
+            or (error_code is not None and "COMPILATION" in str(error_code).upper())
+        )
+        if status == "failed" and error_msg and not is_compile_failure:
+            low = error_msg.lower()
             if (
-                "CUDA" in error_msg
-                or "cuda" in error_msg.lower()
-                or "illegal memory access" in error_msg.lower()
-                or "device-side assert" in error_msg.lower()
+                "illegal memory access" in low
+                or "device-side assert" in low
+                or "cuda error" in low
             ):
                 raise RuntimeError(f"CUDA error detected: {error_msg}")
 

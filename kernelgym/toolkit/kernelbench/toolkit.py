@@ -8,6 +8,7 @@ import torch
 
 from kernelgym.common import ErrorCode
 from kernelgym.config import settings
+from kernelgym.utils.traceback_utils import capture_runtime_error
 from kernelgym.schema import (
     EvaluationTask,
     EvaluationResult,
@@ -188,6 +189,8 @@ class KernelBenchToolkit(Toolkit):
             from kernelgym.utils.error_classifier import classify_error
 
             error_code = classify_error(str(e), "runtime")
+            _meta_error = capture_runtime_error(e)
+            _error_msg = f"Evaluation failed: {_meta_error}"
             return EvaluationResult(
                 task_id=task.task_id,
                 compiled=False,
@@ -196,9 +199,9 @@ class KernelBenchToolkit(Toolkit):
                 reference_runtime=0.0,
                 kernel_runtime=0.0,
                 speedup=0.0,
-                metadata={"error": str(e)},
+                metadata={"error": _meta_error},
                 status="failed",
-                error_message=f"Evaluation failed: {str(e)}",
+                error_message=_error_msg,
                 error_code=error_code,
             )
 
@@ -363,16 +366,15 @@ class KernelBenchToolkit(Toolkit):
                     )
 
             return KernelEvaluationResult.from_kernel_exec_result(
-                task.task_id,
-                task.base_task_id,
-                result,
-                verbose_errors=verbose_errors,
+                task.task_id, task.base_task_id, result
             )
 
         except Exception as e:
             from kernelgym.utils.error_classifier import classify_error
 
             error_code = classify_error(str(e), "runtime")
+            _meta_error = capture_runtime_error(e)
+            _error_msg = f"Kernel evaluation failed: {_meta_error}"
             return KernelEvaluationResult(
                 task_id=task.task_id,
                 base_task_id=task.base_task_id,
@@ -380,8 +382,8 @@ class KernelBenchToolkit(Toolkit):
                 correctness=False,
                 decoy_kernel=False,
                 kernel_runtime=0.0,
-                metadata={"error": str(e)},
+                metadata={"error": _meta_error},
                 status="failed",
-                error_message=f"Kernel evaluation failed: {str(e)}",
+                error_message=_error_msg,
                 error_code=error_code,
             )

@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
+import traceback
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Union
+
+from kernelgym.utils.traceback_utils import (
+    capture_compile_error,
+    capture_runtime_error,
+)
 
 import torch
 
 from kernelgym.config import settings
+from kernelgym.phase_state import enter_phase
 from kernelgym.toolkit.kernelbench import triton_detect as detect
 from kernelgym.toolkit.kernelbench.exec_types import KernelExecResult, get_error_name, set_seed
 from kernelgym.toolkit.kernelbench.loading import (
@@ -109,6 +117,7 @@ def _run_correctness_step(
     seed_num: int,
     device: Union[torch.device, int],
 ) -> KernelExecResult:
+    enter_phase("correctness")
     if verbose:
         print("[Eval] Checking Correctness")
     _phase_start = time.perf_counter()
@@ -127,7 +136,7 @@ def _run_correctness_step(
         return result
     except Exception as e:
         _record_phase(metadata, "correctness", time.perf_counter() - _phase_start)
-        metadata["runtime_error"] = e
+        metadata["runtime_error"] = capture_runtime_error(e)
         metadata["runtime_error_name"] = get_error_name(e)
         return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
@@ -207,6 +216,7 @@ def _run_performance_step(
     device: Union[torch.device, int],
     enable_profiling: bool,
 ):
+    enter_phase("performance")
     _perf_phase_start = time.perf_counter()
     try:
         _run_performance_step_impl(
@@ -448,7 +458,7 @@ def _run_performance_step_impl(
     except Exception as e:
         if verbose:
             print(f"[Eval] Error in Measuring Performance: {e}")
-        kernel_exec_result.metadata["error_during_performance"] = e
+        kernel_exec_result.metadata["error_during_performance"] = capture_runtime_error(e)
 
 def eval_kernel_against_ref(
     original_model_src: str,
@@ -518,6 +528,7 @@ def eval_kernel_against_ref(
         print("[Eval] Loading Original Model")
     _record_phase(metadata, "setup", time.perf_counter() - _setup_phase_start)
 
+    enter_phase("compile")
     _load_phase_start = time.perf_counter()
     with _timed(metadata, "load.original_model"):
         Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
@@ -636,7 +647,11 @@ def eval_kernel_against_ref(
                 if not artifact.get("compiled"):
                     error = artifact.get("error", "Unknown compile error")
                     failed_build_dir = artifact.get("build_dir")
-                    if "lock" in str(error) or "No such file or directory" in str(error):
+                    # Only check the Python exception message for lock
+                    # contention, not the captured nvcc output (which may
+                    # contain "blockIdx" etc. that happen to include "lock").
+                    _error_tail = str(error).rsplit("\n", 1)[-1]
+                    if "lock" in _error_tail:
                         print(
                             f"[Eval] Lock file error during compilation, Please retry. Error: {error}"
                         )
@@ -659,16 +674,66 @@ def eval_kernel_against_ref(
                 backend_session = backend_adapter.open_session(backend_handle, device=device)
                 tempfile_handle = backend_handle.get("tempfile_handle")
             else:
-                if is_triton:
-                    ModelNew, tempfile_handle = load_custom_model_with_tempfile(
-                        custom_model_src, entry_point=f"{entry_point}New"
-                    )
-                    if verbose:
-                        print("[Eval] Model with Triton Loaded")
-                else:
-                    ModelNew = load_custom_model(custom_model_src, context, build_dir)
+                # Non-compile-offload path: compilation happens in-process.
+                # ``load_inline(verbose=True)`` writes nvcc output to fd 1
+                # via ``subprocess.run(stdout=1)``.  Capture fd 1+2 at the
+                # OS level so the diagnostic is preserved.
+                _old_1, _old_2 = os.dup(1), os.dup(2)
+                _capture_r_fd, _w = os.pipe()
+                os.dup2(_w, 1)
+                os.dup2(_w, 2)
+                os.close(_w)
+                try:
+                    if is_triton:
+                        ModelNew, tempfile_handle = load_custom_model_with_tempfile(
+                            custom_model_src, entry_point=f"{entry_point}New"
+                        )
+                        if verbose:
+                            print("[Eval] Model with Triton Loaded")
+                    else:
+                        ModelNew = load_custom_model(custom_model_src, context, build_dir)
+                finally:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os.dup2(_old_1, 1)
+                    os.dup2(_old_2, 2)
+                    os.close(_old_1)
+                    os.close(_old_2)
+                # Compilation succeeded – drain and close the capture pipe.
+                try:
+                    os.close(_capture_r_fd)
+                except OSError:
+                    pass
             torch.cuda.synchronize(device=device)
     except Exception as e:
+        # Drain captured fd output (non-blocking) so nvcc diagnostics are
+        # included in the compilation error visible to the client.
+        _compile_output = ""
+        try:
+            _capture_r_fd  # noqa: B018 - only defined in non-offload path
+        except NameError:
+            _capture_r_fd = None
+        if _capture_r_fd is not None:
+            try:
+                import fcntl as _fcntl
+                _fl = _fcntl.fcntl(_capture_r_fd, _fcntl.F_GETFL)
+                _fcntl.fcntl(_capture_r_fd, _fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+                _chunks = []
+                while True:
+                    try:
+                        _chunk = os.read(_capture_r_fd, 65536)
+                        if not _chunk:
+                            break
+                        _chunks.append(_chunk)
+                    except (BlockingIOError, OSError):
+                        break
+                _compile_output = b"".join(_chunks).decode("utf-8", errors="replace")
+            finally:
+                try:
+                    os.close(_capture_r_fd)
+                except OSError:
+                    pass
+
         print(
             f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
         )
@@ -680,14 +745,20 @@ def eval_kernel_against_ref(
         except (NameError, AttributeError):
             pass
 
-        if "lock" in str(e) or "No such file or directory" in str(e):
+        if "lock" in str(e):
             print(
                 f"[Eval] Lock file error during compilation, Please retry. Error: {e}"
             )
             _cleanup(cleanup_build_dir=_failed_build_dir)
             return None
+
+        _error_msg = capture_compile_error(
+            e,
+            captured_output=_compile_output,
+        )
+
         metadata["compilation_error_name"] = get_error_name(e)
-        metadata["compilation_error"] = e
+        metadata["compilation_error"] = _error_msg
         _record_memory_peak(metadata, device)
         _cleanup(cleanup_build_dir=_failed_build_dir)
         _record_phase(metadata, "load", time.perf_counter() - _load_phase_start)
@@ -722,7 +793,7 @@ def eval_kernel_against_ref(
         )
         _record_memory_peak(metadata, device)
         _cleanup()
-        metadata["runtime_error"] = e
+        metadata["runtime_error"] = capture_runtime_error(e)
         metadata["runtime_error_name"] = get_error_name(e)
         _record_phase(metadata, "load", time.perf_counter() - _load_phase_start)
         _record_phase(metadata, "total", time.perf_counter() - _total_phase_start)
@@ -856,6 +927,7 @@ def eval_reference_only(
 
     kernel_exec_result = KernelExecResult(compiled=True, correctness=True, metadata=metadata)
 
+    enter_phase("performance")
     _ref_perf_start = time.perf_counter()
     try:
         if verbose:
@@ -910,7 +982,7 @@ def eval_reference_only(
     except Exception as e:
         if verbose:
             print(f"[Eval] Error in Measuring Performance: {e}")
-        kernel_exec_result.metadata["error_during_performance"] = e
+        kernel_exec_result.metadata["error_during_performance"] = capture_runtime_error(e)
     finally:
         _record_phase(metadata, "performance", time.perf_counter() - _ref_perf_start)
 

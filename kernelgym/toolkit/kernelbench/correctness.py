@@ -14,6 +14,7 @@ from kernelgym.toolkit.kernelbench.exec_types import (
     get_error_name,
     set_seed,
 )
+from kernelgym.utils.traceback_utils import capture_runtime_error
 
 
 def _record_phase_ms(metadata: dict, phase: str, elapsed_sec: float) -> None:
@@ -73,7 +74,7 @@ def _run_single_correctness_trial(
     trial_seed: int,
     device: Any,
     verbose: bool,
-) -> tuple[bool, float | None]:
+) -> tuple[bool, float | None, float | None]:
     """Run one correctness trial."""
     # Pre-bind names so the ``finally`` block below can ``del`` them unconditionally.
     inputs = None
@@ -131,11 +132,12 @@ def _run_single_correctness_trial(
         atol, rtol = 1e-02, 1e-02  # FP16/BF16
         output.sub_(output_new).abs_()  # output := |output - output_new|
         max_diff = output.max().item()
+        avg_diff = output.mean().item()
         max_abs_b = output_new.abs_().max().item()
         is_close = max_diff <= atol + rtol * max_abs_b
         _record_phase_ms(metadata, "correctness.compare", time.perf_counter() - _t)
 
-        return is_close, max_diff
+        return is_close, max_diff, avg_diff
     finally:
         # Drop local references to any GPU-resident objects on every exit
         # path (success / mismatch / runtime error).
@@ -166,7 +168,7 @@ def run_and_check_correctness(
                 print(f"[Eval] Generating Random Input with seed {trial_seed}")
 
             try:
-                is_close, max_diff = _run_single_correctness_trial(
+                is_close, max_diff, avg_diff = _run_single_correctness_trial(
                     original_model_instance=original_model_instance,
                     new_model_instance=new_model_instance,
                     get_inputs_fn=get_inputs_fn,
@@ -194,9 +196,7 @@ def run_and_check_correctness(
                 err_name = get_error_name(e)
                 print("[Error] Exception happens during correctness check")
                 print(f"Error in launching kernel for ModelNew: {err_msg}")
-                metadata = register_and_format_exception(
-                    "runtime_error", err_msg, metadata, truncate=False
-                )
+                metadata["runtime_error"] = capture_runtime_error(e)
                 metadata["runtime_error_name"] = err_name
                 metadata["correctness_trials"] = (
                     f"({pass_count} / {num_correct_trials})"
@@ -208,6 +208,7 @@ def run_and_check_correctness(
                 )
 
             metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
+            metadata.setdefault("avg_difference", []).append(f"{avg_diff:.6f}")
             if is_close:
                 pass_count += 1
                 continue
@@ -221,11 +222,15 @@ def run_and_check_correctness(
 
     metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
 
-    # Fold the per-trial max_difference list into ``correctness_issue``
-    diffs = metadata.pop("max_difference", None)
-    if diffs and "correctness_issue" in metadata:
+    # Fold the per-trial max/avg difference lists into ``correctness_issue``
+    max_diffs = metadata.pop("max_difference", None)
+    avg_diffs = metadata.pop("avg_difference", None)
+    if max_diffs and "correctness_issue" in metadata:
+        parts = [f"max_difference=[{', '.join(max_diffs)}]"]
+        if avg_diffs:
+            parts.append(f"avg_difference=[{', '.join(avg_diffs)}]")
         metadata["correctness_issue"] = (
-            f"{metadata['correctness_issue']}; max_difference=[{', '.join(diffs)}]"
+            f"{metadata['correctness_issue']}; {'; '.join(parts)}"
         )
 
     if pass_count == num_correct_trials:

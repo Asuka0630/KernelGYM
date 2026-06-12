@@ -90,27 +90,31 @@ def _build_compile_failed_result(
 ) -> Dict[str, Any]:
     """Construct a ``compiled=False`` result without involving the GPU.
 
-    Mirrors what ``GPUWorker._build_failed_result`` produces, plus the
-    compile_offload phase timings so the bench summary surfaces them.
-    The phase keys mirror the success path: ``compile_offload`` is the
-    pure nvcc time, ``compile_offload_queue_wait`` is the time the task
-    spent waiting for a free pool slot, and ``load`` mirrors the legacy
-    bucket name so existing clients keep showing it.
+    Aligns the produced metadata / error_message shape with the
+    in-subprocess (``ENABLE_COMPILE_OFFLOAD=false``) path.
     """
     from kernelgym.schema import (
         EvaluationResult,
         KernelEvaluationResult,
     )
+    from kernelgym.toolkit.kernelbench.exec_types import KernelExecResult
 
-    error_code = classify_error(error_message, "compile")
     task_id = task_data.get("task_id", "unknown")
     base_task_id = task_data.get("base_task_id", task_id)
     task_type = task_data.get("task_type", "evaluation")
 
-    metadata = {
-        "error": error_message,
+    # Best-effort recovery of the original exception class name from the
+    # offload worker's "<ClassName>: <message>" prefix
+    # (compile_offload._compile_in_worker writes this format), to align with
+    # the in-subprocess path that records ``get_error_name(e)``.
+    err_name = "compile_error"
+    prefix, sep, _ = error_message.partition(": ")
+    if sep and prefix and " " not in prefix and prefix.isidentifier():
+        err_name = prefix
+
+    metadata: Dict[str, Any] = {
         "compilation_error": error_message,
-        "compilation_error_name": "compile_offload_error",
+        "compilation_error_name": err_name,
         "phase_timings_ms": {
             "compile_offload": float(elapsed_nvcc_sec) * 1000.0,
             "compile_offload_queue_wait": float(queue_wait_sec) * 1000.0,
@@ -120,20 +124,22 @@ def _build_compile_failed_result(
         },
     }
 
+    exec_result = KernelExecResult(
+        compiled=False,
+        correctness=False,
+        decoy_kernel=False,
+        runtime=-1.0,
+        metadata=metadata,
+    )
+
+    kernel_view = KernelEvaluationResult.from_kernel_exec_result(
+        task_id=task_id,
+        base_task_id=base_task_id,
+        result=exec_result,
+    )
+
     if task_type == "kernel_evaluation":
-        result = KernelEvaluationResult(
-            task_id=task_id,
-            base_task_id=base_task_id,
-            compiled=False,
-            correctness=False,
-            decoy_kernel=False,
-            kernel_runtime=-1.0,
-            metadata=metadata,
-            status="failed",
-            error_message=error_message,
-            error_code=error_code,
-        )
-        return result.to_dict()
+        return kernel_view.to_dict()
 
     result = EvaluationResult(
         task_id=task_id,
@@ -143,10 +149,10 @@ def _build_compile_failed_result(
         reference_runtime=-1.0,
         kernel_runtime=-1.0,
         speedup=0.0,
-        metadata=metadata,
+        metadata=kernel_view.metadata,
         status="failed",
-        error_message=error_message,
-        error_code=error_code,
+        error_message=kernel_view.error_message,
+        error_code=kernel_view.error_code,
     )
     return result.to_dict()
 
@@ -160,13 +166,8 @@ class CompileService:
         self.task_manager: Optional[TaskManager] = None
         self.pool: Optional[CompileOffloadPool] = None
         self.max_workers = max(1, int(getattr(settings, "compile_offload_workers", 8)))
-        self.timeout_sec = float(
-            getattr(settings, "compile_offload_timeout_sec", 180.0) or 180.0
-        )
-        self.artifact_ttl_sec = max(
-            300,
-            int(getattr(settings, "compile_offload_timeout_sec", 180.0) or 180.0) * 4,
-        )
+        self.timeout_sec = float(settings.default_timeout)
+        self.artifact_ttl_sec = max(300, int(self.timeout_sec) * 4)
         self._sem = asyncio.Semaphore(self.max_workers)
         self._in_flight: set[asyncio.Task] = set()
         self._stats = {
@@ -330,6 +331,9 @@ class CompileService:
         device_str = task_data.get("device") or "cuda:0"
         loop = asyncio.get_event_loop()
 
+        # End-to-end task budget = min(operator ceiling, client-requested).
+        compile_timeout = min(self.timeout_sec, float(task_data["timeout"]))
+
         # Wall-clock from the moment the task was popped off the compile
         # queue. ``elapsed_total`` includes:
         #   * waiting for a free pool slot (when WORKERS < concurrency)
@@ -354,7 +358,7 @@ class CompileService:
                 backend_name=backend_name,
                 backend_adapter=backend_adapter,
                 device_str=device_str,
-                timeout=self.timeout_sec,
+                timeout=compile_timeout,
             )
 
         try:
@@ -428,6 +432,21 @@ class CompileService:
             f"(nvcc={elapsed_nvcc:.2f}s, queue_wait={queue_wait:.2f}s) "
             f"at {build_dir}"
         )
+
+        remaining = max(0, int(compile_timeout - elapsed_total))
+        task_data["timeout"] = remaining
+        try:
+            await self.task_manager.redis.hset(
+                f"{self.task_manager.task_prefix}{task_id}",
+                "data",
+                json.dumps(task_data),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to write reduced timeout back to redis for {task_id}: {exc}; "
+                f"GPU stage will use the original payload timeout"
+            )
+
         await self._forward_to_gpu(task_data)
 
     async def _forward_to_gpu(self, task_data: Dict[str, Any]) -> None:

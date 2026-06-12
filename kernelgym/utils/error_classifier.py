@@ -25,6 +25,32 @@ def classify_error(error_message: str, context: Optional[str] = None) -> ErrorCo
     if any(re.search(pattern, error_lower) for pattern in validation_patterns):
         return ErrorCode.VALIDATION_ERROR
 
+    # Timeouts must be checked before generic compile/runtime patterns so a
+    # message like "compile timeout after 180s" is routed to the dedicated
+    # COMPILATION_TIMEOUT bucket instead of the generic COMPILATION_ERROR.
+    compile_timeout_patterns = [
+        r"compile.*timeout",
+        r"compilation.*timeout",
+        r"nvcc.*timeout",
+        r"build.*timeout",
+    ]
+    if any(re.search(pattern, error_lower) for pattern in compile_timeout_patterns):
+        return ErrorCode.COMPILATION_TIMEOUT
+
+    runtime_timeout_patterns = [
+        r"runtime.*timeout",
+        r"execution.*timeout",
+        r"kernel.*timeout",
+        r"task.*timeout",
+        r"time.*limit.*exceeded",
+        r"hung.*task",
+        r"stuck.*task",
+        r"\btimeout\b",
+        r"timed.*out",
+    ]
+    if any(re.search(pattern, error_lower) for pattern in runtime_timeout_patterns):
+        return ErrorCode.RUNTIME_TIMEOUT
+
     compilation_patterns = [
         r"compilation failed",
         r"compile.*error",
@@ -65,17 +91,6 @@ def classify_error(error_message: str, context: Optional[str] = None) -> ErrorCo
     if any(re.search(pattern, error_lower) for pattern in correctness_patterns):
         return ErrorCode.CORRECTNESS_ERROR
 
-    timeout_patterns = [
-        r"timeout",
-        r"task.*timed.*out",
-        r"execution.*timeout",
-        r"time.*limit.*exceeded",
-        r"hung.*task",
-        r"stuck.*task",
-    ]
-    if any(re.search(pattern, error_lower) for pattern in timeout_patterns):
-        return ErrorCode.TIMEOUT_ERROR
-
     system_patterns = [
         r"system.*error",
         r"internal.*server.*error",
@@ -106,14 +121,16 @@ def classify_error(error_message: str, context: Optional[str] = None) -> ErrorCo
         context_lower = context.lower()
         if "validation" in context_lower:
             return ErrorCode.VALIDATION_ERROR
+        if "compile_timeout" in context_lower:
+            return ErrorCode.COMPILATION_TIMEOUT
+        if "runtime_timeout" in context_lower or "exec_timeout" in context_lower:
+            return ErrorCode.RUNTIME_TIMEOUT
         if "compilation" in context_lower or "compile" in context_lower:
             return ErrorCode.COMPILATION_ERROR
         if "runtime" in context_lower or "execution" in context_lower:
             return ErrorCode.RUNTIME_ERROR
         if "correctness" in context_lower:
             return ErrorCode.CORRECTNESS_ERROR
-        if "timeout" in context_lower:
-            return ErrorCode.TIMEOUT_ERROR
         if "system" in context_lower:
             return ErrorCode.SYSTEM_ERROR
         if "resource" in context_lower:
@@ -127,9 +144,10 @@ def get_error_description(error_code: ErrorCode) -> str:
     descriptions = {
         ErrorCode.VALIDATION_ERROR: "Code validation failed - invalid or dangerous code detected",
         ErrorCode.COMPILATION_ERROR: "Kernel compilation failed - syntax or build errors",
+        ErrorCode.COMPILATION_TIMEOUT: "Kernel compilation timed out (nvcc/build did not finish in budget)",
         ErrorCode.RUNTIME_ERROR: "Kernel runtime error - execution or GPU errors",
+        ErrorCode.RUNTIME_TIMEOUT: "Kernel runtime timed out (kernel compiled but execution exceeded budget)",
         ErrorCode.CORRECTNESS_ERROR: "Correctness check failed - output doesn't match reference",
-        ErrorCode.TIMEOUT_ERROR: "Task timeout - execution took too long",
         ErrorCode.SYSTEM_ERROR: "System error - internal service or infrastructure issue",
         ErrorCode.RESOURCE_ERROR: "Resource error - insufficient memory or unavailable resources",
         ErrorCode.UNKNOWN_ERROR: "Unknown error - unclassified error type",
@@ -142,9 +160,10 @@ def get_error_category(error_code: ErrorCode) -> str:
     categories = {
         ErrorCode.VALIDATION_ERROR: "input",
         ErrorCode.COMPILATION_ERROR: "compilation",
+        ErrorCode.COMPILATION_TIMEOUT: "compilation",
         ErrorCode.RUNTIME_ERROR: "runtime",
+        ErrorCode.RUNTIME_TIMEOUT: "runtime",
         ErrorCode.CORRECTNESS_ERROR: "correctness",
-        ErrorCode.TIMEOUT_ERROR: "timeout",
         ErrorCode.SYSTEM_ERROR: "system",
         ErrorCode.RESOURCE_ERROR: "resource",
         ErrorCode.UNKNOWN_ERROR: "unknown",
