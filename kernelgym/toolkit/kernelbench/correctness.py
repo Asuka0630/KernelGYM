@@ -14,6 +14,7 @@ from kernelgym.toolkit.kernelbench.exec_types import (
     get_error_name,
     set_seed,
 )
+from kernelgym.utils.traceback_utils import capture_runtime_error
 
 
 def _record_phase_ms(metadata: dict, phase: str, elapsed_sec: float) -> None:
@@ -195,9 +196,7 @@ def run_and_check_correctness(
                 err_name = get_error_name(e)
                 print("[Error] Exception happens during correctness check")
                 print(f"Error in launching kernel for ModelNew: {err_msg}")
-                metadata = register_and_format_exception(
-                    "runtime_error", err_msg, metadata, truncate=False
-                )
+                metadata["runtime_error"] = capture_runtime_error(e)
                 metadata["runtime_error_name"] = err_name
                 metadata["correctness_trials"] = (
                     f"({pass_count} / {num_correct_trials})"

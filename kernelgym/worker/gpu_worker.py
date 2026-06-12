@@ -670,6 +670,16 @@ class GPUWorker:
         if not result_data.get("success", False):
             error_type = result_data.get("error_type", "Unknown")
             error_message = result_data.get("error_message", "Unknown error")
+            # Preserve any traceback captured by the subprocess worker so the
+            # client sees the full stack pointing into the user's kernel code.
+            tb = result_data.get("traceback", "") or ""
+            tb = tb.strip() if isinstance(tb, str) else ""
+            if tb:
+                error_message = (
+                    str(error_message).rstrip()
+                    + "\n\nSubprocess Traceback:\n"
+                    + tb
+                )
             raise RuntimeError(f"{error_type}: {error_message}")
 
         return result_data["result"]

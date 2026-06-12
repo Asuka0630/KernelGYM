@@ -13,6 +13,7 @@ from kernelgym.toolkit.kernelbench.exec_types import set_seed, get_error_name
 from kernelgym.toolkit.kernelbench.timing import get_timing_stats, time_execution_with_cuda_event
 from kernelgym.toolkit.validation import validate_code
 from kernelgym.toolkit.base import Toolkit
+from kernelgym.utils.traceback_utils import compile_with_source
 
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
@@ -57,7 +58,7 @@ def _normalize_cases(raw_cases: Any) -> List[Dict[str, Any]]:
 
 def _load_cases_from_code(code: str) -> Tuple[List[Dict[str, Any]], Any]:
     context: Dict[str, Any] = {}
-    compile(code, "<string>", "exec")
+    compile_with_source(code, "<string>", "exec")
     exec(code, context)
     get_cases = context.get("get_cases")
     get_inputs = context.get("get_inputs")
@@ -74,7 +75,7 @@ def _load_cases_from_code(code: str) -> Tuple[List[Dict[str, Any]], Any]:
 
 def _load_init_inputs_from_code(code: str) -> Any:
     context: Dict[str, Any] = {}
-    compile(code, "<string>", "exec")
+    compile_with_source(code, "<string>", "exec")
     exec(code, context)
     get_init_inputs = context.get("get_init_inputs")
     return get_init_inputs() if callable(get_init_inputs) else []

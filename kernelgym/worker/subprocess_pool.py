@@ -19,6 +19,8 @@ import time
 import logging
 import traceback
 import multiprocessing as mp
+
+from kernelgym.utils.traceback_utils import format_user_traceback
 import queue
 import asyncio
 from typing import Dict, Any, Optional, List
@@ -799,11 +801,12 @@ def _persistent_worker_loop(
                     )
 
                     # 返回错误结果，并标记 worker 将退出
+                    _user_tb = format_user_traceback()
                     result_queue.put({
                         "success": False,
                         "error_type": error_type,
                         "error_message": error_message,
-                        "traceback": traceback.format_exc(),
+                        "traceback": _user_tb,
                         "worker_exiting": True,  # 关键标记！
                         "cuda_error": is_cuda_error,
                         "profiling_error": is_profiler_error
@@ -834,11 +837,12 @@ def _persistent_worker_loop(
                         file=sys.stderr
                     )
 
+                    _user_tb = format_user_traceback()
                     result_queue.put({
                         "success": False,
                         "error_type": error_type,
                         "error_message": error_message,
-                        "traceback": traceback.format_exc(),
+                        "traceback": _user_tb,
                         "worker_exiting": False,
                         "cuda_error": False
                     })

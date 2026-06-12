@@ -9,6 +9,7 @@ from typing import Any, Dict
 from kernelgym.toolkit.kernelbench.loading import load_custom_model
 from kernelgym.toolkit.kernelbench.compile import build_compile_cache
 from kernelgym.toolkit.validation import validate_code
+from kernelgym.utils.traceback_utils import capture_compile_error, compile_with_source
 
 from .base import KernelBenchBackendBase
 
@@ -34,11 +35,12 @@ class KernelBenchCudaBackend(KernelBenchBackendBase):
             }
 
         try:
-            compile(code, "<string>", "exec")
+            compile_with_source(code, "<string>", "exec")
         except SyntaxError as exc:
+            _error = capture_compile_error(exc)
             return {
                 "compiled": False,
-                "error": f"Syntax error in kernel code: {exc}",
+                "error": _error,
                 "device": str(device),
                 "entry_point": entry_point,
                 "backend": backend,

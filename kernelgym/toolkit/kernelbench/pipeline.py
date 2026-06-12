@@ -5,8 +5,14 @@ from __future__ import annotations
 import os
 import sys
 import time
+import traceback
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Union
+
+from kernelgym.utils.traceback_utils import (
+    capture_compile_error,
+    capture_runtime_error,
+)
 
 import torch
 
@@ -130,7 +136,7 @@ def _run_correctness_step(
         return result
     except Exception as e:
         _record_phase(metadata, "correctness", time.perf_counter() - _phase_start)
-        metadata["runtime_error"] = e
+        metadata["runtime_error"] = capture_runtime_error(e)
         metadata["runtime_error_name"] = get_error_name(e)
         return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
@@ -452,7 +458,7 @@ def _run_performance_step_impl(
     except Exception as e:
         if verbose:
             print(f"[Eval] Error in Measuring Performance: {e}")
-        kernel_exec_result.metadata["error_during_performance"] = e
+        kernel_exec_result.metadata["error_during_performance"] = capture_runtime_error(e)
 
 def eval_kernel_against_ref(
     original_model_src: str,
@@ -746,10 +752,10 @@ def eval_kernel_against_ref(
             _cleanup(cleanup_build_dir=_failed_build_dir)
             return None
 
-        # Prepend raw nvcc output so the full diagnostic reaches the client.
-        _error_msg = str(e)
-        if _compile_output.strip():
-            _error_msg = _compile_output.rstrip() + "\n" + _error_msg
+        _error_msg = capture_compile_error(
+            e,
+            captured_output=_compile_output,
+        )
 
         metadata["compilation_error_name"] = get_error_name(e)
         metadata["compilation_error"] = _error_msg
@@ -787,7 +793,7 @@ def eval_kernel_against_ref(
         )
         _record_memory_peak(metadata, device)
         _cleanup()
-        metadata["runtime_error"] = e
+        metadata["runtime_error"] = capture_runtime_error(e)
         metadata["runtime_error_name"] = get_error_name(e)
         _record_phase(metadata, "load", time.perf_counter() - _load_phase_start)
         _record_phase(metadata, "total", time.perf_counter() - _total_phase_start)
@@ -976,7 +982,7 @@ def eval_reference_only(
     except Exception as e:
         if verbose:
             print(f"[Eval] Error in Measuring Performance: {e}")
-        kernel_exec_result.metadata["error_during_performance"] = e
+        kernel_exec_result.metadata["error_during_performance"] = capture_runtime_error(e)
     finally:
         _record_phase(metadata, "performance", time.perf_counter() - _ref_perf_start)
 

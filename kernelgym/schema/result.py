@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import traceback
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional
 
@@ -15,38 +14,6 @@ from .serialization import coerce_error_code, make_json_safe, serialize_error_co
 def _filter_fields(cls, data: Dict[str, Any]) -> Dict[str, Any]:
     valid_fields = {f.name for f in cls.__dataclass_fields__.values()}
     return {k: v for k, v in data.items() if k in valid_fields}
-
-
-def _dedup_ninja_echo(log: str) -> str:
-    """Drop ninja's verbatim command-line echo right after ``FAILED:``.
-
-    ninja's output for a failing build step looks like::
-
-        [N/M] <full nvcc/g++ command line>
-        FAILED: <object>
-        <full nvcc/g++ command line>            <-- duplicate of the [N/M] line
-        <actual stderr from the compiler>
-
-    Removing the duplicate keeps the actionable diagnostic.
-    """
-    if not log or "FAILED:" not in log:
-        return log
-    lines = log.splitlines()
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        if line.lstrip().startswith("FAILED:") and i + 1 < len(lines):
-            dup = lines[i + 1]
-            # Treat the next line as a duplicate echo when it appears as
-            # the tail of any previously emitted line (handles ``[N/M] ``
-            # prefix on the first occurrence).
-            if dup and any(prev.endswith(dup) for prev in out[:-1]):
-                i += 2
-                continue
-        i += 1
-    return "\n".join(out)
 
 
 @dataclass
@@ -107,15 +74,19 @@ class KernelEvaluationResult:
         task_id: str,
         base_task_id: str,
         result: KernelExecResult,
-        verbose_errors: bool = True,
     ) -> "KernelEvaluationResult":
         metadata: Dict[str, Any] = dict(result.metadata or {})
 
+        # All upstream call sites now pass strings into ``metadata``
+        # (see kernelgym.utils.traceback_utils.capture_compile_error /
+        # capture_runtime_error).  Defensive coercion only handles the
+        # rare case where a non-string slipped through.
         for key in (
             "compilation_error",
             "runtime_error",
             "error",
             "correctness_issue",
+            "error_during_performance",
             "triton_kernel_coverage",
             "num_custom_kernels",
             "num_total_kernels",
@@ -124,43 +95,19 @@ class KernelEvaluationResult:
             "total_kernel_run_time_in_profiling_us",
             "custom_kernel_cuda_time_coverage",
         ):
-            if key in metadata and metadata[key] is not None and not isinstance(
-                metadata[key], (str, int, float, bool)
-            ):
-                if isinstance(metadata[key], BaseException):
-                    if verbose_errors:
-                        if metadata[key].__traceback__:
-                            metadata[key] = "".join(
-                                traceback.format_exception(
-                                    type(metadata[key]),
-                                    metadata[key],
-                                    metadata[key].__traceback__,
-                                )
-                            )
-                        else:
-                            metadata[key] = (
-                                f"{type(metadata[key]).__name__}: {str(metadata[key])}"
-                            )
-                    else:
-                        metadata[key] = str(metadata[key])
-                else:
-                    metadata[key] = str(metadata[key])
-
-        # Collapse ninja's redundant command echo in compile-failure logs.
-        # ``torch.utils.cpp_extension`` -> ninja prints, for the failing
-        # step, the full command line *twice* (once as ``[N/M] <cmd>`` and
-        # once again right after ``FAILED:`` before the actual stderr).
-        # Drop the second copy so agents only see the diagnostic.
-        for key in ("compilation_error", "error"):
-            if isinstance(metadata.get(key), str):
-                metadata[key] = _dedup_ninja_echo(metadata[key])
+            value = metadata.get(key)
+            if value is None or isinstance(value, (str, int, float, bool)):
+                continue
+            metadata[key] = str(value)
 
         error_message: Optional[str] = None
         error_code: Optional[ErrorCode] = None
 
         if not result.compiled:
-            detail = metadata.get("compilation_error") or metadata.get("error") or metadata.get(
-                "validation_error"
+            detail = (
+                metadata.get("compilation_error")
+                or metadata.get("error")
+                or metadata.get("validation_error")
             )
             if detail:
                 error_message = f"Kernel compilation failed: {detail}"
