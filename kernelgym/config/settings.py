@@ -12,35 +12,47 @@ PROJECT_ROOT = Path(__file__).parent.parent
 KERNELBENCH_ROOT = PROJECT_ROOT.parent
 
 
-def _parse_str_list_or_comma(v: Any) -> List[str]:
-    """Parse a JSON array or comma-separated string into a list of strings."""
-    if isinstance(v, str):
-        v = v.strip()
-        if not v:
-            return []
-        try:
-            import json
+def _parse_str_list(v: str, default: List[str]) -> List[str]:
+    """Parse a JSON / Python-literal array, or comma-separated string.
 
-            return json.loads(v)
-        except json.JSONDecodeError:
-            return [p.strip() for p in v.split(",") if p.strip()]
+    Tries, in order:
+      1. ``json.loads``      — handles  ``["-lineinfo"]``
+      2. ``ast.literal_eval`` — handles  ``['-lineinfo']`` (Python literal, safe in .env)
+      3. comma-split          — handles  ``-lineinfo``, ``-O3,-lineinfo``,
+                                 or ``[-lineinfo]`` (shell-stripped JSON)
+    """
+    v = v.strip()
+    if not v:
+        return list(default)
+    try:
+        import json
+        return json.loads(v)
+    except json.JSONDecodeError:
+        pass
+    try:
+        import ast
+        return ast.literal_eval(v)
+    except (ValueError, SyntaxError):
+        pass
+    # Bare brackets from shell-stripped JSON (export FOO="[\"val\"]" → FOO=[val])
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return [f.strip().strip('"').strip("'") for f in v.split(",") if f.strip()]
+
+
+def _parse_str_list_or_comma(v: Any) -> List[str]:
+    """Parse a JSON/Python array or comma-separated string into a list of strings."""
+    if isinstance(v, str):
+        return _parse_str_list(v, default=[])
     if isinstance(v, list):
         return v
     return []
 
 
 def _parse_ncu_extra_cflags(v: Any) -> List[str]:
-    """Parse NCU_EXTRA_CFLAGS — same as _parse_str_list_or_comma but defaults to ['-lineinfo']."""
+    """Parse NCU_EXTRA_CFLAGS — defaults to ['-lineinfo'] when empty."""
     if isinstance(v, str):
-        v = v.strip()
-        if not v:
-            return ["-lineinfo"]
-        try:
-            import json
-
-            return json.loads(v)
-        except json.JSONDecodeError:
-            return [f.strip() for f in v.split(",") if f.strip()]
+        return _parse_str_list(v, default=["-lineinfo"])
     if isinstance(v, list):
         return v
     return ["-lineinfo"]
