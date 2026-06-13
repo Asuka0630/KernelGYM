@@ -34,6 +34,9 @@ pip-delete-this-directory.txt
 dump.rdb
 *.rdb
 
+# env
+.env
+
 # ide
 .claude/
 .idea/
