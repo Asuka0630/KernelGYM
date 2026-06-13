@@ -2,13 +2,48 @@
 
 import os
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Annotated
 
-from pydantic import Field, validator
+from pydantic import Field, validator, BeforeValidator
 from pydantic_settings import BaseSettings
+from pydantic_settings.sources.types import NoDecode
 
 PROJECT_ROOT = Path(__file__).parent.parent
 KERNELBENCH_ROOT = PROJECT_ROOT.parent
+
+
+def _parse_str_list_or_comma(v: Any) -> List[str]:
+    """Parse a JSON array or comma-separated string into a list of strings."""
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            return []
+        try:
+            import json
+
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return [p.strip() for p in v.split(",") if p.strip()]
+    if isinstance(v, list):
+        return v
+    return []
+
+
+def _parse_ncu_extra_cflags(v: Any) -> List[str]:
+    """Parse NCU_EXTRA_CFLAGS — same as _parse_str_list_or_comma but defaults to ['-lineinfo']."""
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            return ["-lineinfo"]
+        try:
+            import json
+
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return [f.strip() for f in v.split(",") if f.strip()]
+    if isinstance(v, list):
+        return v
+    return ["-lineinfo"]
 
 
 class Settings(BaseSettings):
@@ -110,15 +145,13 @@ class Settings(BaseSettings):
         env="NCU_TOP_K_RULES",
         description="Top-K NCU rule suggestions (sorted by estimated speedup) attached to metadata.ncu.",
     )
-    ncu_python_extra_paths: List[str] = Field(
+    ncu_python_extra_paths: Annotated[List[str], NoDecode, BeforeValidator(_parse_str_list_or_comma)] = Field(
         default_factory=list,
-        env="NCU_PYTHON_EXTRA_PATHS",
         description="Extra sys.path entries to locate the ncu_report Python module "
                     "(e.g. /usr/local/cuda/nsight-compute-XXXX.X.X/extras/python).",
     )
-    ncu_extra_cflags: List[str] = Field(
+    ncu_extra_cflags: Annotated[List[str], NoDecode, BeforeValidator(_parse_ncu_extra_cflags)] = Field(
         default_factory=lambda: ["-lineinfo"],
-        env="NCU_EXTRA_CFLAGS",
         description="Extra nvcc cflags injected into torch load_inline when NCU is enabled "
                     "(at minimum -lineinfo so source-level metrics map back to source).",
     )

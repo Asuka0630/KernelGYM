@@ -205,12 +205,12 @@ COMPILE_OFFLOAD_BUILD_ROOT="${COMPILE_OFFLOAD_BUILD_ROOT:-build}"
 NCU_SET="${NCU_SET:-full}"
 NCU_TIMEOUT_SEC="${NCU_TIMEOUT_SEC:-180}"
 NCU_TOP_K_RULES="${NCU_TOP_K_RULES:-5}"
-# Comma-separated list; leave empty to let the runtime auto-scan
+# JSON array; leave empty/[] to let the runtime auto-scan
 # /usr/local/cuda*/nsight-compute-*/extras/python.
-NCU_PYTHON_EXTRA_PATHS="${NCU_PYTHON_EXTRA_PATHS:-}"
-# Comma-separated nvcc cflags injected into torch.load_inline so the
+NCU_PYTHON_EXTRA_PATHS="${NCU_PYTHON_EXTRA_PATHS:-[]}"
+# JSON array of nvcc cflags injected into torch.load_inline so the
 # compiled .so carries source line info for ncu source-level metrics.
-NCU_EXTRA_CFLAGS="${NCU_EXTRA_CFLAGS:--lineinfo}"
+NCU_EXTRA_CFLAGS="${NCU_EXTRA_CFLAGS:-[\"-lineinfo\"]}"
 
 cat > "${ENV_FILE}" <<EOF
 # KernelGym Auto-Generated Configuration
