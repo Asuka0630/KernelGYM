@@ -160,6 +160,21 @@ class KernelBenchToolkit(Toolkit):
                     else settings.ncu_top_k_rules
                 ),
                 kernel_names=task.kernel_names,
+                enable_anti_hack=(
+                    bool(task.enable_anti_hack)
+                    if task.enable_anti_hack is not None
+                    else True
+                ),
+                anti_hack_ratio_min=(
+                    float(task.anti_hack_ratio_min)
+                    if task.anti_hack_ratio_min is not None
+                    else 0.02
+                ),
+                anti_hack_profiling_trials=(
+                    int(task.anti_hack_profiling_trials)
+                    if task.anti_hack_profiling_trials is not None
+                    else 3
+                ),
             )
 
             if not run_correctness:
@@ -352,6 +367,21 @@ class KernelBenchToolkit(Toolkit):
                     else settings.ncu_top_k_rules
                 ),
                 kernel_names=task.kernel_names,
+                enable_anti_hack=(
+                    bool(task.enable_anti_hack)
+                    if task.enable_anti_hack is not None
+                    else True
+                ),
+                anti_hack_ratio_min=(
+                    float(task.anti_hack_ratio_min)
+                    if task.anti_hack_ratio_min is not None
+                    else 0.02
+                ),
+                anti_hack_profiling_trials=(
+                    int(task.anti_hack_profiling_trials)
+                    if task.anti_hack_profiling_trials is not None
+                    else 3
+                ),
             )
 
             if not run_correctness:

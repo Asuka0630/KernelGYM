@@ -114,6 +114,17 @@ class KernelBenchWorkflowController(WorkflowController):
         )
         if eval_task.kernel_names is not None:
             kernel_payload["kernel_names"] = list(eval_task.kernel_names)
+
+        # Anti-hack decoy detection — per-request control (already in
+        # KernelEvaluationTask via _create_paired_tasks, but resolve None
+        # defaults explicitly so the worker payload is self-contained).
+        if eval_task.enable_anti_hack is not None:
+            kernel_payload["enable_anti_hack"] = bool(eval_task.enable_anti_hack)
+        if eval_task.anti_hack_ratio_min is not None:
+            kernel_payload["anti_hack_ratio_min"] = float(eval_task.anti_hack_ratio_min)
+        if eval_task.anti_hack_profiling_trials is not None:
+            kernel_payload["anti_hack_profiling_trials"] = int(eval_task.anti_hack_profiling_trials)
+
         kernel_task_spec = TaskSpec(
             kind="kernelbench.kernel",
             payload=kernel_payload,

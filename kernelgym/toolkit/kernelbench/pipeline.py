@@ -215,6 +215,10 @@ def _run_performance_step(
     seed_num: int,
     device: Union[torch.device, int],
     enable_profiling: bool,
+    enable_anti_hack: bool = False,
+    anti_hack_trials: int = 3,
+    anti_hack_ratio_min: float = 0.02,
+    skip_profiler_anti_hack: bool = False,
 ):
     enter_phase("performance")
     _perf_phase_start = time.perf_counter()
@@ -230,6 +234,10 @@ def _run_performance_step(
             seed_num=seed_num,
             device=device,
             enable_profiling=enable_profiling,
+            enable_anti_hack=enable_anti_hack,
+            anti_hack_trials=anti_hack_trials,
+            anti_hack_ratio_min=anti_hack_ratio_min,
+            skip_profiler_anti_hack=skip_profiler_anti_hack,
         )
     finally:
         _record_phase(metadata, "performance", time.perf_counter() - _perf_phase_start)
@@ -247,6 +255,10 @@ def _run_performance_step_impl(
     seed_num: int,
     device: Union[torch.device, int],
     enable_profiling: bool,
+    enable_anti_hack: bool = False,
+    anti_hack_trials: int = 3,
+    anti_hack_ratio_min: float = 0.02,
+    skip_profiler_anti_hack: bool = False,
 ):
     def _profiling_empty(metrics: Dict[str, Any]) -> bool:
         if not metrics:
@@ -283,6 +295,9 @@ def _run_performance_step_impl(
                     device=device,
                     enable_profiling=enable_profiling,
                     metadata=metadata,
+                    enable_anti_hack=enable_anti_hack,
+                    anti_hack_trials=anti_hack_trials,
+                    skip_profiling_anti_hack=skip_profiler_anti_hack,
                 )
             runtime_stats = get_timing_stats(elapsed_times, device=device)
 
@@ -439,18 +454,72 @@ def _run_performance_step_impl(
                             f"Custom kernel CUDA time: {custom_kernel_cuda_time_in_profiling_us:.2f}us / Total time: {total_kernel_run_time_in_profiling_us:.2f}us, Coverage: {ratio_time:.2%}"
                         )
 
-                    if num_custom_kernels == 0 and num_total_kernels > 0:
-                        print(
-                            f"[WARNING] Profiler captured {num_total_kernels} kernels but 0 custom kernels - marking as decoy"
+                    # Always surface the time ratio on metadata (informational,
+                    # surfaced even when enable_anti_hack is off).
+                    kernel_exec_result.metadata["custom_kernel_time_ratio"] = ratio_time
+                    metadata["custom_kernel_time_ratio"] = ratio_time
+
+                    # ── Stage 2: ratio-based anti-hack decoy detection ──────
+                    if enable_anti_hack:
+                        # Preserve Stage 1 reason if already set; Stage 2 only
+                        # acts when no prior decoy determination exists.
+                        _already_decoy = (
+                            kernel_exec_result
+                            and kernel_exec_result.decoy_kernel
+                            and kernel_exec_result.metadata.get("anti_hack_reason")
                         )
-                        kernel_exec_result.decoy_kernel = True
-                    elif num_custom_kernels == 0 and num_total_kernels == 0:
-                        print(
-                            "[WARNING] Profiler captured 0 total kernels - likely profiler bug, NOT marking as decoy"
-                        )
-                        print(
-                            f"[INFO] Relying on Triton hook detection instead (detected: {metadata.get('triton_profiler_used', False)})"
-                        )
+
+                        if num_total_kernels > 0:
+                            if num_custom_kernels == 0:
+                                print(
+                                    f"[WARNING] Profiler captured {num_total_kernels} kernels "
+                                    f"but 0 custom kernels - marking as decoy (reason=no_custom_kernel)"
+                                )
+                                if not _already_decoy:
+                                    kernel_exec_result.decoy_kernel = True
+                                    kernel_exec_result.metadata["anti_hack_reason"] = "no_custom_kernel"
+                                    metadata["anti_hack_reason"] = "no_custom_kernel"
+                            elif ratio_time < anti_hack_ratio_min:
+                                print(
+                                    f"[WARNING] Custom kernel time ratio={ratio_time:.4f} "
+                                    f"< {anti_hack_ratio_min} - marking as decoy (reason=low_time_ratio)"
+                                )
+                                if not _already_decoy:
+                                    kernel_exec_result.decoy_kernel = True
+                                    kernel_exec_result.metadata["anti_hack_reason"] = "low_time_ratio"
+                                    metadata["anti_hack_reason"] = "low_time_ratio"
+                            else:
+                                print(
+                                    f"[INFO] Custom kernel time ratio={ratio_time:.4f} "
+                                    f">= {anti_hack_ratio_min} — genuine kernel"
+                                )
+                        elif num_total_kernels == 0:
+                            print(
+                                "[WARNING] Profiler captured 0 total kernels - "
+                                "likely profiler bug, NOT marking as decoy"
+                            )
+                            print(
+                                f"[INFO] Relying on Triton hook detection instead "
+                                f"(detected: {metadata.get('triton_profiler_used', False)})"
+                            )
+
+                        # Merge Stage 2 unmatched __global__ names into dead_code_kernels
+                        # (cross-cutting hint: kernels declared but never observed at
+                        # runtime).  Only performed when anti-hack is enabled.
+                        _stage2_dead = [
+                            n for n in (triton_kernels_not_in_profiling or [])
+                        ]
+                        if _stage2_dead:
+                            _prev_dead = metadata.get("dead_code_kernels")
+                            if isinstance(_prev_dead, list):
+                                _merged_dead = list(_prev_dead) + [
+                                    n for n in _stage2_dead if n not in _prev_dead
+                                ]
+                            else:
+                                _merged_dead = _stage2_dead
+                            metadata["dead_code_kernels"] = _merged_dead
+                            if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+                                kernel_exec_result.metadata["dead_code_kernels"] = _merged_dead
                 if verbose:
                     print(f"[Eval] Performance Stats: {runtime_stats}")
                 kernel_exec_result.runtime = runtime_stats["mean"]
@@ -644,6 +713,9 @@ def eval_kernel_against_ref(
     enable_ncu: bool = False,
     ncu_top_k_rules: int = 5,
     kernel_names: Optional[List[str]] = None,
+    enable_anti_hack: bool = True,
+    anti_hack_ratio_min: float = 0.02,
+    anti_hack_profiling_trials: int = 3,
 ) -> KernelExecResult:
     """Evaluate a custom kernel against a reference model.
 
@@ -672,6 +744,12 @@ def eval_kernel_against_ref(
         Explicit kernel-name list for the ``ncu -k 'regex:...'`` filter.
         When None, the function falls back to extracting names from
         ``custom_model_src`` via ``extract_global_kernel_names``.
+    enable_anti_hack : bool, default True
+        Enable two-stage decoy detection (AST early-exit + profiler ratio).
+    anti_hack_ratio_min : float, default 0.02
+        Custom-kernel time ratio below which a kernel is marked decoy (Stage 2).
+    anti_hack_profiling_trials : int, default 3
+        Number of light-profiling iterations for Stage 2 ratio check.
     """
     return _eval_kernel_against_ref_impl(
         original_model_src=original_model_src,
@@ -693,6 +771,9 @@ def eval_kernel_against_ref(
         enable_ncu=enable_ncu,
         ncu_top_k_rules=ncu_top_k_rules,
         kernel_names=kernel_names,
+        enable_anti_hack=enable_anti_hack,
+        anti_hack_ratio_min=anti_hack_ratio_min,
+        anti_hack_profiling_trials=anti_hack_profiling_trials,
     )
 
 
@@ -716,6 +797,9 @@ def _eval_kernel_against_ref_impl(
     enable_ncu: bool = False,
     ncu_top_k_rules: int = 5,
     kernel_names: Optional[List[str]] = None,
+    enable_anti_hack: bool = True,
+    anti_hack_ratio_min: float = 0.02,
+    anti_hack_profiling_trials: int = 3,
 ) -> KernelExecResult:
     _total_phase_start = time.perf_counter()
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
@@ -1080,6 +1164,52 @@ def _eval_kernel_against_ref_impl(
             if verbose:
                 print(f"[Eval] CUDA kernel names from source: {cuda_names}")
 
+    # ── Stage 1: AST-based anti-hack (zero GPU cost) ─────────────────────
+    _skip_profiler_anti_hack = False
+
+    if enable_anti_hack and kernel_exec_result and kernel_exec_result.correctness:
+        try:
+            from kernelgym.toolkit.exposed_ops import (
+                extract_exposed_op_names,
+                analyze_forward_calls,
+            )
+            exposed = extract_exposed_op_names(custom_model_src)
+            if exposed:
+                report = analyze_forward_calls(custom_model_src, exposed)
+                # Only report dead_code_kernels when analysis is definitive
+                # (no opaque dispatch).  Opaque patterns (alias / getattr / …)
+                # may hide real call-sites, so labelling any op as "dead"
+                # would be unreliable.
+                if report.uncalled_exposed and not report.has_opaque_dispatch:
+                    kernel_exec_result.metadata["dead_code_kernels"] = report.uncalled_exposed
+                    metadata["dead_code_kernels"] = report.uncalled_exposed
+                    if verbose:
+                        print(
+                            f"[AntiHack] Stage 1 dead_code_kernels: {report.uncalled_exposed}"
+                        )
+                # Early exit: exposed non-empty AND zero call-sites AND no opaque dispatch
+                if exposed and not report.called_exposed and not report.has_opaque_dispatch:
+                    kernel_exec_result.decoy_kernel = True
+                    kernel_exec_result.metadata["anti_hack_reason"] = "ast_no_call_site"
+                    metadata["anti_hack_reason"] = "ast_no_call_site"
+                    _skip_profiler_anti_hack = True
+                    if verbose:
+                        print(
+                            "[AntiHack] Stage 1 marked decoy (ast_no_call_site) — "
+                            f"exposed={exposed}, called={report.called_exposed}, "
+                            f"opaque={report.has_opaque_dispatch}"
+                        )
+                elif report.has_opaque_dispatch and verbose:
+                    print(
+                        "[AntiHack] Stage 1: has_opaque_dispatch=True — "
+                        "falling back to Stage 2 profiler"
+                    )
+            elif verbose:
+                print("[AntiHack] Stage 1: no exposed op names — skip")
+        except Exception as e:
+            if verbose:
+                print(f"[AntiHack] Stage 1 AST analysis failed (conservative no-op): {e}")
+
     if measure_performance:
         _run_performance_step(
             kernel_exec_result=kernel_exec_result,
@@ -1092,6 +1222,10 @@ def _eval_kernel_against_ref_impl(
             seed_num=seed_num,
             device=device,
             enable_profiling=enable_profiling,
+            enable_anti_hack=enable_anti_hack,
+            anti_hack_trials=anti_hack_profiling_trials,
+            anti_hack_ratio_min=anti_hack_ratio_min,
+            skip_profiler_anti_hack=_skip_profiler_anti_hack,
         )
 
     # NCU profiling — runs in a fresh subprocess so it can't pollute
