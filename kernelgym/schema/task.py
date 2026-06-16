@@ -38,6 +38,10 @@ class EvaluationTask:
     enable_ncu: Optional[bool] = None
     ncu_top_k_rules: Optional[int] = 5
     kernel_names: Optional[List[str]] = None
+    # Anti-hack decoy detection (per-request)
+    enable_anti_hack: Optional[bool] = True
+    anti_hack_ratio_min: Optional[float] = 0.02
+    anti_hack_profiling_trials: Optional[int] = 3
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -104,6 +108,10 @@ class KernelEvaluationTask:
     enable_ncu: Optional[bool] = None
     ncu_top_k_rules: Optional[int] = 5
     kernel_names: Optional[List[str]] = None
+    # Anti-hack decoy detection (per-request)
+    enable_anti_hack: Optional[bool] = True
+    anti_hack_ratio_min: Optional[float] = 0.02
+    anti_hack_profiling_trials: Optional[int] = 3
     resources: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:

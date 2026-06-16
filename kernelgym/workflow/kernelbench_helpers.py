@@ -117,6 +117,9 @@ def _create_paired_tasks(
         enable_ncu=task.enable_ncu,
         ncu_top_k_rules=task.ncu_top_k_rules,
         kernel_names=task.kernel_names,
+        enable_anti_hack=task.enable_anti_hack,
+        anti_hack_ratio_min=task.anti_hack_ratio_min,
+        anti_hack_profiling_trials=task.anti_hack_profiling_trials,
         resources=task.resources,
     )
 

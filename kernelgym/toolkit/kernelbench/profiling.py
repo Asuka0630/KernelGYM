@@ -64,7 +64,15 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
 
 
 @contextmanager
-def profiling_context(enabled: bool = True):
+def profiling_context(enabled: bool = True, light: bool = False):
+    """Context manager that wraps ``torch.profiler.profile``.
+
+    Args:
+        enabled: When False, immediately yields None (no-op).
+        light: When True, runs a lightweight config — CUDA activity only,
+            no record_shapes / profile_memory / with_stack.  Used by the
+            anti-hack Stage 2 profiler ratio check to minimise overhead.
+    """
     if not enabled:
         yield None
         return
@@ -78,46 +86,59 @@ def profiling_context(enabled: bool = True):
         if "cuda" in settings.profiling_activities:
             activities.append(profiler.ProfilerActivity.CUDA)
 
-        print(f"[Profiler] Initializing with activities: {[str(a) for a in activities]}")
+        if light:
+            # Light mode: CUDA-only, no shapes / memory / stack overhead
+            activities = [profiler.ProfilerActivity.CUDA]
+            _record_shapes = False
+            _profile_memory = False
+            _with_stack = False
+        else:
+            _record_shapes = settings.profiling_record_shapes
+            _profile_memory = settings.profiling_profile_memory
+            _with_stack = settings.profiling_with_stack
+
+        mode_tag = "light" if light else "full"
+        print(f"[Profiler] Initializing ({mode_tag}) with activities: {[str(a) for a in activities]}")
 
         if not activities:
             print("[Profiler] No activities configured, profiler will return no data")
             yield None
             return
 
+        # Self-test CUDA before entering the profiler so the test's own
+        # kernels (torch.ones / sum) are NOT captured and don't dilute the
+        # custom-kernel time ratio used by anti-hack Stage 2.
+        cuda_available = torch.cuda.is_available()
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        device_info = "cuda:unavailable"
+        if cuda_available:
+            try:
+                current_device = torch.cuda.current_device()
+                device_name = torch.cuda.get_device_name(current_device)
+                device_info = f"cuda:{current_device} ({device_name})"
+                test = torch.ones((1024,), device="cuda")
+                _ = test.sum()
+                torch.cuda.synchronize()
+                print("[Profiler] Self-test CUDA op executed")
+            except Exception as e:
+                print(f"[Profiler] Self-test failed: {e}")
+                device_info = f"cuda:unknown (error={e})"
+        print(
+            f"[Profiler] Context pid={os.getpid()} cuda_available={cuda_available}",
+            f" device={device_info} CUDA_VISIBLE_DEVICES={cuda_visible}",
+        )
+
         prof = profiler.profile(
             activities=activities,
-            record_shapes=settings.profiling_record_shapes,
-            profile_memory=settings.profiling_profile_memory,
-            with_stack=settings.profiling_with_stack,
+            record_shapes=_record_shapes,
+            profile_memory=_profile_memory,
+            with_stack=_with_stack,
             on_trace_ready=None,
         )
 
         prof.__enter__()
         try:
             print("[Profiler] Profiler started successfully")
-            cuda_available = torch.cuda.is_available()
-            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            device_info = "cuda:unavailable"
-            if cuda_available:
-                try:
-                    current_device = torch.cuda.current_device()
-                    device_name = torch.cuda.get_device_name(current_device)
-                    device_info = f"cuda:{current_device} ({device_name})"
-                except Exception as e:
-                    device_info = f"cuda:unknown (error={e})"
-            print(
-                f"[Profiler] Context pid={os.getpid()} cuda_available={cuda_available}",
-                f" device={device_info} CUDA_VISIBLE_DEVICES={cuda_visible}",
-            )
-            if cuda_available:
-                try:
-                    test = torch.ones((1024,), device="cuda")
-                    _ = test.sum()
-                    torch.cuda.synchronize()
-                    print("[Profiler] Self-test CUDA op executed")
-                except Exception as e:
-                    print(f"[Profiler] Self-test failed: {e}")
             yield prof
         finally:
             try:

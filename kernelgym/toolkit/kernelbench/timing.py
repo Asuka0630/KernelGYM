@@ -42,6 +42,9 @@ def time_execution_with_cuda_event(
     device: torch.device = None,
     enable_profiling: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
+    enable_anti_hack: bool = False,
+    anti_hack_trials: int = 3,
+    skip_profiling_anti_hack: bool = False,
 ) -> Tuple[List[float], Dict[str, Any]]:
     if device is None:
         if verbose:
@@ -77,17 +80,35 @@ def time_execution_with_cuda_event(
     _record_phase_ms(metadata, "performance.measure.timing_trials", time.perf_counter() - _trials_start)
 
     profiling_metrics: Dict[str, Any] = {}
-    if enable_profiling:
+
+    # Decide whether to run profiling.  Two triggers:
+    #   1. enable_profiling           — full diagnostic (legacy behaviour).
+    #   2. enable_anti_hack           — lightweight ratio check (Stage 2).
+    # When Stage 1 already ruled decoy (skip_profiling_anti_hack), bail out.
+    _should_profile = enable_profiling or (enable_anti_hack and not skip_profiling_anti_hack)
+
+    if _should_profile:
         _prof_start = time.perf_counter()
         try:
             torch.cuda.synchronize(device=device)
 
-            num_profiling_trials = min(10, num_trials)
+            if enable_profiling:
+                # Full diagnostic: up to 10 trials, heavy config
+                num_profiling_trials = min(10, num_trials)
+                _light = False
+                _tag = "full"
+            else:
+                # Anti-hack only: configurable trials (default 3), light config
+                num_profiling_trials = anti_hack_trials
+                _light = True
+                _tag = "light (anti-hack)"
+
             print(
-                f"[Profiling] Running {num_profiling_trials} additional iterations for profiling..."
+                f"[Profiling] Running {num_profiling_trials} additional "
+                f"iterations for profiling ({_tag})..."
             )
 
-            with profiling_context(True) as prof:
+            with profiling_context(True, light=_light) as prof:
                 for _ in range(num_profiling_trials):
                     kernel_fn(*args)
                 torch.cuda.synchronize(device=device)
