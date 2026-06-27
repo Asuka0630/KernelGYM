@@ -107,6 +107,26 @@ def _record_memory_peak(
         _merge_into(kernel_exec_result.metadata)
 
 
+def _mark_decoy(
+    kernel_exec_result: KernelExecResult,
+    metadata: Dict[str, Any],
+    *,
+    reason: str,
+    detection: str,
+) -> None:
+    """Mark a result as decoy with a user-facing reason classification.
+
+    ``anti_hack_reason`` names what is wrong with the kernel.  The detection
+    mechanism is kept separately so downstream consumers do not need to parse
+    implementation details like "ast" or "profiling" from the reason.
+    """
+    kernel_exec_result.decoy_kernel = True
+    kernel_exec_result.metadata["anti_hack_reason"] = reason
+    kernel_exec_result.metadata["anti_hack_detection"] = detection
+    metadata["anti_hack_reason"] = reason
+    metadata["anti_hack_detection"] = detection
+
+
 def _run_correctness_step(
     original_model,
     custom_model,
@@ -187,7 +207,12 @@ def _run_triton_detection_step(
                     print(
                         "[Eval] Backend is 'triton' but no Triton usage detected, marking as decoy"
                     )
-                    kernel_exec_result.decoy_kernel = True
+                    _mark_decoy(
+                        kernel_exec_result,
+                        metadata,
+                        reason="triton_kernel_not_used",
+                        detection="triton_usage_probe",
+                    )
                     kernel_exec_result.runtime = -1.0
                     return True
                     if not used:
@@ -473,21 +498,29 @@ def _run_performance_step_impl(
                             if num_custom_kernels == 0:
                                 print(
                                     f"[WARNING] Profiler captured {num_total_kernels} kernels "
-                                    f"but 0 custom kernels - marking as decoy (reason=no_custom_kernel)"
+                                    "but 0 custom kernels - marking as decoy "
+                                    "(reason=custom_kernel_not_executed)"
                                 )
                                 if not _already_decoy:
-                                    kernel_exec_result.decoy_kernel = True
-                                    kernel_exec_result.metadata["anti_hack_reason"] = "no_custom_kernel"
-                                    metadata["anti_hack_reason"] = "no_custom_kernel"
+                                    _mark_decoy(
+                                        kernel_exec_result,
+                                        metadata,
+                                        reason="custom_kernel_not_executed",
+                                        detection="profiling_custom_kernel_coverage",
+                                    )
                             elif ratio_time < anti_hack_ratio_min:
                                 print(
                                     f"[WARNING] Custom kernel time ratio={ratio_time:.4f} "
-                                    f"< {anti_hack_ratio_min} - marking as decoy (reason=low_time_ratio)"
+                                    f"< {anti_hack_ratio_min} - marking as decoy "
+                                    "(reason=custom_kernel_underused)"
                                 )
                                 if not _already_decoy:
-                                    kernel_exec_result.decoy_kernel = True
-                                    kernel_exec_result.metadata["anti_hack_reason"] = "low_time_ratio"
-                                    metadata["anti_hack_reason"] = "low_time_ratio"
+                                    _mark_decoy(
+                                        kernel_exec_result,
+                                        metadata,
+                                        reason="custom_kernel_underused",
+                                        detection="profiling_custom_kernel_time_ratio",
+                                    )
                             else:
                                 print(
                                     f"[INFO] Custom kernel time ratio={ratio_time:.4f} "
@@ -1189,13 +1222,17 @@ def _eval_kernel_against_ref_impl(
                         )
                 # Early exit: exposed non-empty AND zero call-sites AND no opaque dispatch
                 if exposed and not report.called_exposed and not report.has_opaque_dispatch:
-                    kernel_exec_result.decoy_kernel = True
-                    kernel_exec_result.metadata["anti_hack_reason"] = "ast_no_call_site"
-                    metadata["anti_hack_reason"] = "ast_no_call_site"
+                    _mark_decoy(
+                        kernel_exec_result,
+                        metadata,
+                        reason="custom_operator_not_called",
+                        detection="source_forward_call_analysis",
+                    )
                     _skip_profiler_anti_hack = True
                     if verbose:
                         print(
-                            "[AntiHack] Stage 1 marked decoy (ast_no_call_site) — "
+                            "[AntiHack] Stage 1 marked decoy "
+                            "(reason=custom_operator_not_called) — "
                             f"exposed={exposed}, called={report.called_exposed}, "
                             f"opaque={report.has_opaque_dispatch}"
                         )
@@ -1206,6 +1243,47 @@ def _eval_kernel_against_ref_impl(
                     )
             elif verbose:
                 print("[AntiHack] Stage 1: no exposed op names — skip")
+
+            # ── Stage 1b: CUDA __global__ kernel launch-site check ──────────
+            # Detect decoys that call the exposed host op in forward but
+            # never actually launch any __global__ kernel (e.g. the host
+            # function uses cuBLAS/cuDNN instead of the declared kernel).
+            #
+            # This source-only pass is intentionally conservative: it only
+            # marks a decoy when there is no launch marker anywhere in the
+            # source and the declared kernel names have no extra references.
+            # Anything ambiguous is left to Stage 2 profiling.
+            if (not kernel_exec_result.decoy_kernel
+                    and not is_triton
+                    and custom_model_src):
+                try:
+                    from kernelgym.toolkit.kernel_names import (
+                        find_uncalled_cuda_kernels,
+                        extract_global_kernel_names,
+                    )
+                    all_kernels = extract_global_kernel_names(custom_model_src)
+                    if all_kernels:
+                        uncalled_cuda = find_uncalled_cuda_kernels(custom_model_src)
+                        if set(uncalled_cuda) == set(all_kernels):
+                            _mark_decoy(
+                                kernel_exec_result,
+                                metadata,
+                                reason="cuda_kernel_not_launched",
+                                detection="source_cuda_launch_analysis",
+                            )
+                            _skip_profiler_anti_hack = True
+                            if verbose:
+                                print(
+                                    "[AntiHack] Stage 1 marked decoy "
+                                    "(reason=cuda_kernel_not_launched) — "
+                                    f"uncalled CUDA kernels: {uncalled_cuda}"
+                                )
+                except Exception as e:
+                    if verbose:
+                        print(
+                            "[AntiHack] Stage 1 CUDA kernel check failed "
+                            f"(conservative no-op): {e}"
+                        )
         except Exception as e:
             if verbose:
                 print(f"[AntiHack] Stage 1 AST analysis failed (conservative no-op): {e}")
