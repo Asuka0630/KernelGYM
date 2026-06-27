@@ -18,7 +18,10 @@ group; we then filter against C/C++ identifier rules.
 
 from __future__ import annotations
 
+import ast
+import io
 import re
+import tokenize
 from typing import Iterable, List, Optional
 
 # Strategy: don't try to write one giant regex that handles every C++
@@ -53,26 +56,39 @@ _RESERVED = {
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _PY_TRIPLE_RE = re.compile(r'"{3}.*?"{3}|\'{3}.*?\'{3}', re.DOTALL)
+_LAUNCH_MARKER_RE = re.compile(r"<<<|cudaLaunch(?:Cooperative)?Kernel\s*\(")
+_OPAQUE_PREPROCESSOR_RE = re.compile(r"^\s*#\s*define\b", re.MULTILINE)
 
 
 def _strip_comments(src: str) -> str:
-    """Remove C/C++ comments AND Python triple-quoted strings.
+    """Remove Python line comments and C/C++ comments.
 
     Note: KernelGYM kernels are typically emitted by an LLM as a Python
     source where the CUDA code lives inside a triple-quoted string passed
     to ``load_inline``. We don't strip those — we WANT to find the
-    ``__global__`` declarations inside. Only strip Python triple-quoted
-    *docstrings* by relying on the fact that real kernel sources contain
-    actual ``__global__`` text (the string-stripping pass would otherwise
-    erase them).
+    ``__global__`` declarations inside.
 
-    Strategy: only strip C/C++ comments; leave Python string literals
-    intact. This is good enough because:
-      * The CUDA code passed to load_inline starts at the line containing
-        ``__global__``, never inside a Python comment.
-      * Python ``# ...`` comments inside a CUDA string also don't match
-        our regex (they're stripped as ``// ...`` would be).
+    Python comments must be removed before launch-site checks; otherwise a
+    Python-side ``# kernel<<<...>>>`` comment can masquerade as a real CUDA
+    launch. ``tokenize`` preserves string literal contents, so CUDA code
+    embedded in Python strings remains visible to the C/C++ pass below.
     """
+    try:
+        ast.parse(src)
+    except SyntaxError:
+        # Raw CUDA/C++ snippets need not be valid Python. In that mode, '#'
+        # may introduce preprocessor directives, not Python comments.
+        pass
+    else:
+        try:
+            tokens = [
+                tok
+                for tok in tokenize.generate_tokens(io.StringIO(src).readline)
+                if tok.type != tokenize.COMMENT
+            ]
+            src = tokenize.untokenize(tokens)
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            pass
     src = _BLOCK_COMMENT_RE.sub("", src)
     src = _LINE_COMMENT_RE.sub("", src)
     return src
@@ -198,6 +214,43 @@ def extract_global_kernel_names(custom_src: str) -> List[str]:
             out.append(name)
         pos = end
     return out
+
+
+def find_uncalled_cuda_kernels(custom_src: str) -> List[str]:
+    """Return CUDA kernels that are definitively uncalled by source evidence.
+
+    This intentionally avoids complete C++/CUDA call-graph analysis.  It only
+    reports kernels when all of these conservative conditions hold:
+
+    * ``custom_src`` declares one or more ``__global__`` kernels.
+    * No C/C++ macro definitions are present; macro expansion can hide
+      launch syntax from this source-only check.
+    * After Python/C/C++ comments are stripped, there is no launch marker at
+      all: neither triple-chevron syntax (``<<<``) nor runtime API
+      (``cudaLaunchKernel`` / ``cudaLaunchCooperativeKernel``).
+    * Each reported kernel name appears exactly once, i.e. in its declaration.
+
+    Any launch marker or extra name reference is treated as opaque and left to
+    Stage 2 profiling.  This keeps the AST/source-only anti-hack pass from
+    false-positively rejecting valid macro, template, or indirect launches.
+    """
+    kernels = extract_global_kernel_names(custom_src)
+    if not kernels:
+        return []
+
+    cleaned = _strip_comments(custom_src)
+    if _OPAQUE_PREPROCESSOR_RE.search(cleaned):
+        return []
+    if _LAUNCH_MARKER_RE.search(cleaned):
+        return []
+
+    uncalled: List[str] = []
+    for kernel in kernels:
+        refs = re.findall(r"\b" + re.escape(kernel) + r"\b", cleaned)
+        if len(refs) == 1:
+            uncalled.append(kernel)
+
+    return uncalled
 
 
 def build_kernel_regex(names: Iterable[str]) -> str:
