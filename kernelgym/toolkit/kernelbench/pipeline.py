@@ -17,7 +17,7 @@ from kernelgym.toolkit.kernelbench.loading import (
     load_original_model_and_inputs,
 )
 from kernelgym.toolkit.kernelbench.correctness import run_and_check_correctness
-from kernelgym.toolkit.kernelbench.profiling import compute_triton_kernel_coverage
+from kernelgym.toolkit.kernelbench.profiling import compute_cuda_kernel_coverage
 from kernelgym.toolkit.kernelbench.timing import (
     get_timing_stats,
     run_profiling_only,
@@ -217,12 +217,12 @@ def _run_performance_step(
                 )
 
                 try:
-                    coverage_result_dict = compute_triton_kernel_coverage(
-                        metadata["triton_profiler_matches"], profiling_metrics
+                    coverage_result_dict = compute_cuda_kernel_coverage(
+                        metadata.get("triton_profiler_matches", []), profiling_metrics
                     )
                 except Exception as coverage_error:
                     print(
-                        f"[ERROR] compute_triton_kernel_coverage failed: {coverage_error}"
+                        f"[ERROR] compute_cuda_kernel_coverage failed: {coverage_error}"
                     )
                     import traceback
 
@@ -230,10 +230,10 @@ def _run_performance_step(
                     coverage_result_dict = {
                         "num_custom_kernels": 0,
                         "num_total_kernels": 0,
-                        "triton_kernels_not_in_profiling": metadata.get(
+                        "cuda_kernels_not_in_profiling": metadata.get(
                             "triton_profiler_matches", []
                         ),
-                        "triton_kernels_in_profiling": [],
+                        "cuda_kernels_in_profiling": [],
                         "total_kernel_run_time_in_profiling_us": 0,
                         "custom_kernel_cuda_time_in_profiling_us": 0,
                     }
@@ -245,11 +245,11 @@ def _run_performance_step(
                 )
                 num_custom_kernels = coverage_result_dict["num_custom_kernels"]
                 num_total_kernels = coverage_result_dict["num_total_kernels"]
-                triton_kernels_not_in_profiling = coverage_result_dict[
-                    "triton_kernels_not_in_profiling"
+                cuda_kernels_not_in_profiling = coverage_result_dict[
+                    "cuda_kernels_not_in_profiling"
                 ]
-                triton_kernels_in_profiling = coverage_result_dict[
-                    "triton_kernels_in_profiling"
+                cuda_kernels_in_profiling = coverage_result_dict[
+                    "cuda_kernels_in_profiling"
                 ]
                 total_kernel_run_time_in_profiling_us = coverage_result_dict[
                     "total_kernel_run_time_in_profiling_us"
@@ -265,9 +265,9 @@ def _run_performance_step(
                     "triton_kernel_coverage"
                 ] = f"Run {num_custom_kernels} custom kernels / Total {num_total_kernels} kernels, Coverage: {ratio:.2%}"
                 metadata["triton_kernel_not_in_profiling"] = (
-                    triton_kernels_not_in_profiling
+                    cuda_kernels_not_in_profiling
                 )
-                metadata["triton_kernel_in_profiling"] = triton_kernels_in_profiling
+                metadata["triton_kernel_in_profiling"] = cuda_kernels_in_profiling
 
                 metadata[
                     "total_kernel_run_time_in_profiling_us"
@@ -293,9 +293,9 @@ def _run_performance_step(
                     kernel_exec_result.metadata[
                         "triton_kernel_coverage"
                     ] = f"Run {num_custom_kernels} custom kernels / Total {num_total_kernels} kernels, Coverage: {ratio:.2%}"
-                    kernel_exec_result.metadata["triton_profiler_matches"] = metadata[
-                        "triton_profiler_matches"
-                    ]
+                    kernel_exec_result.metadata["triton_profiler_matches"] = metadata.get(
+                        "triton_profiler_matches", []
+                    )
 
                     kernel_exec_result.metadata[
                         "custom_kernel_cuda_time_in_profiling_us"
@@ -538,6 +538,25 @@ def eval_kernel_against_ref(
     if decoy_detected:
         _cleanup()
         return kernel_exec_result
+
+    if not is_triton and not metadata.get("triton_profiler_matches"):
+        try:
+            from kernelgym.toolkit.kernel_names import extract_global_kernel_names
+
+            cuda_names = extract_global_kernel_names(custom_model_src)
+            metadata["triton_profiler_matches"] = cuda_names
+            metadata["cuda_kernel_names_from_source"] = cuda_names
+            if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+                kernel_exec_result.metadata["triton_profiler_matches"] = cuda_names
+                kernel_exec_result.metadata["cuda_kernel_names_from_source"] = cuda_names
+            if verbose and cuda_names:
+                print(f"[Eval] CUDA kernel names from source: {cuda_names}")
+        except Exception as e:
+            metadata["cuda_kernel_name_extraction_error"] = e
+            if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+                kernel_exec_result.metadata["cuda_kernel_name_extraction_error"] = e
+            if verbose:
+                print(f"[Eval] CUDA kernel name extraction failed: {e}")
 
     if measure_performance:
         _run_performance_step(

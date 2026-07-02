@@ -14,7 +14,7 @@ from kernelgym.config import settings
 logger = logging.getLogger("kernelgym.toolkit.kernelbench.profiling")
 
 
-def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling_result: Dict[str, Any]):
+def compute_cuda_kernel_coverage(matched_cuda_kernels: List[str], profilling_result: Dict[str, Any]):
     """Compute the coverage of the matched triton kernels in the profiling result."""
 
     def _matches_profiler_name(captured: str, profiler_name: str) -> bool:
@@ -26,7 +26,7 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
             return True
         return False
 
-    kernels = matched_triton_kernels
+    kernels = matched_cuda_kernels
     num_custom_kernels = 0
     kernel_names = [kernel.split(" ")[0] for kernel in kernels]
 
@@ -34,7 +34,7 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
 
     total_time = 0.0
     matched_cuda_time = 0.0
-    triton_kernels_in_profiling = []
+    cuda_kernels_in_profiling = []
 
     for prof_kernel in kernels_in_profiling:
         prof_name = prof_kernel["name"]
@@ -43,14 +43,14 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
         total_time += cuda_time + cpu_time
 
         if any(_matches_profiler_name(kernel_name, prof_name) for kernel_name in kernel_names):
-            triton_kernels_in_profiling.append(prof_name)
+            cuda_kernels_in_profiling.append(prof_name)
             num_custom_kernels += 1
             matched_cuda_time += cuda_time
 
-    triton_kernels_not_in_profiling = [
+    cuda_kernels_not_in_profiling = [
         kernel_name
         for kernel_name in kernel_names
-        if not any(_matches_profiler_name(kernel_name, prof_name) for prof_name in triton_kernels_in_profiling)
+        if not any(_matches_profiler_name(kernel_name, prof_name) for prof_name in cuda_kernels_in_profiling)
     ]
 
     return {
@@ -58,8 +58,8 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
         "num_total_kernels": len(kernels_in_profiling),
         "total_kernel_run_time_in_profiling_us": total_time,
         "custom_kernel_cuda_time_in_profiling_us": matched_cuda_time,
-        "triton_kernels_not_in_profiling": triton_kernels_not_in_profiling,
-        "triton_kernels_in_profiling": triton_kernels_in_profiling,
+        "cuda_kernels_not_in_profiling": cuda_kernels_not_in_profiling,
+        "cuda_kernels_in_profiling": cuda_kernels_in_profiling,
     }
 
 
