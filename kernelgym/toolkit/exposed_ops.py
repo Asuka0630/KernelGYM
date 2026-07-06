@@ -19,6 +19,10 @@ Forward analysis:
   * Walks forward + any ``self.<helper>(...)`` helper methods within
     the same class.
   * Collects all ``ast.Call`` target names and matches against exposed set.
+  * Conservatively treats exposed-op calls in any local ``nn.Module.forward``
+    as real enough to avoid a source-only "not called" verdict when the
+    exact ``ModelNew`` reachability is obscured by constructs like
+    ``ModuleDict`` or lambdas.
   * Detects opaque dispatch patterns that prevent reliable static analysis
     (getattr / alias / torch.ops.* / functools.partial).
 """
@@ -262,12 +266,32 @@ def analyze_forward_calls(
                 if _is_opaque_call(node):
                     has_opaque = True
 
+    seen_calls: Set[str] = set(call_targets)
+
+    alias_calls = _find_called_self_attr_operator_aliases(
+        model_class, all_forwards, exposed_set
+    )
+    if alias_calls:
+        seen_calls.update(alias_calls)
+
     # --- alias pattern detection (separate pass, across all forwards) ---
     if not has_opaque:
         has_opaque = _has_alias_pattern(forward_node, all_forwards)
 
+    # ``ModuleDict`` / ``Sequential`` / lambda-held modules are common in
+    # KernelBench models and are deliberately hard to prove reachable with a
+    # small AST pass.  If an exposed op is called by any local Module.forward,
+    # do not claim it was not called; mark the path opaque so Stage 2 can make
+    # the execution-based decision.
+    fallback_calls = _find_exposed_calls_in_any_forward(all_modules, exposed_set)
+    if fallback_calls - seen_calls:
+        seen_calls.update(fallback_calls)
+        has_opaque = True
+
+    if not has_opaque:
+        has_opaque = _has_self_lambda_call_pattern(model_class, all_forwards)
+
     # --- compute breakdown ---
-    seen_calls: Set[str] = set(call_targets)
     called = [n for n in exposed_names if n in seen_calls]
     uncalled = [n for n in exposed_names if n not in seen_calls]
 
@@ -530,6 +554,92 @@ def _extract_call_target(call_node: ast.Call) -> Optional[str]:
     return None
 
 
+def _find_exposed_calls_in_any_forward(
+    all_module_classes: Dict[str, ast.ClassDef],
+    exposed_set: Set[str],
+) -> Set[str]:
+    """Return exposed op names called by any local ``nn.Module.forward``.
+
+    This is a conservative fallback for source-only anti-hack checks.  It is
+    not a proof that the op is reachable from ``ModelNew.forward``; it only
+    prevents a false "custom operator not called" verdict when the small call
+    graph builder cannot follow containers or lambdas.
+    """
+    calls: Set[str] = set()
+    if not exposed_set:
+        return calls
+
+    for cls in all_module_classes.values():
+        forward = _find_method(cls, "forward")
+        if forward is None:
+            continue
+        for node in ast.walk(forward):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = _extract_call_target(node)
+            if callee in exposed_set:
+                calls.add(callee)
+    return calls
+
+
+def _find_called_self_attr_operator_aliases(
+    model_class: ast.ClassDef,
+    forward_chain: List[ast.FunctionDef],
+    exposed_set: Set[str],
+) -> Set[str]:
+    """Resolve ``self.alias = ext.exposed_op`` then ``self.alias(...)``.
+
+    LLM kernels often cache an extension function on ``self`` during
+    ``__init__``.  The call target in ``forward`` is then the alias attribute,
+    not the exported op name, so plain call-target matching would falsely mark
+    the extension as unused.
+    """
+    if not exposed_set:
+        return set()
+
+    init_node = _find_method(model_class, "__init__")
+    if init_node is None:
+        return set()
+
+    alias_to_exposed: Dict[str, str] = {}
+
+    def record_alias(target: ast.expr, value: ast.expr) -> None:
+        if not (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+        ):
+            return
+        if isinstance(value, ast.Attribute) and value.attr in exposed_set:
+            alias_to_exposed[target.attr] = value.attr
+
+    for node in ast.walk(init_node):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                record_alias(target, node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            record_alias(node.target, node.value)
+
+    if not alias_to_exposed:
+        return set()
+
+    called: Set[str] = set()
+    for func_node in forward_chain:
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "self"
+                and func.attr in alias_to_exposed
+            ):
+                called.add(alias_to_exposed[func.attr])
+
+    return called
+
+
 # ---------------------------------------------------------------------------
 # AST helpers — opaque dispatch detection
 # ---------------------------------------------------------------------------
@@ -611,6 +721,53 @@ def _has_alias_pattern(
         detector.visit(func_node)
         if detector.has_alias_call:
             return True
+    return False
+
+
+def _has_self_lambda_call_pattern(
+    model_class: ast.ClassDef,
+    forward_chain: List[ast.FunctionDef],
+) -> bool:
+    """Return True for ``self.foo = lambda ...`` then ``self.foo(...)``.
+
+    The lambda body may hide arbitrary dispatch, including extension calls via
+    closed-over module containers.  Treat it as opaque rather than proving
+    custom operators dead from an incomplete call graph.
+    """
+    lambda_attrs: Set[str] = set()
+    init_node = _find_method(model_class, "__init__")
+    if init_node is None:
+        return False
+
+    for node in ast.walk(init_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Lambda):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                lambda_attrs.add(target.attr)
+
+    if not lambda_attrs:
+        return False
+
+    for func_node in forward_chain:
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "self"
+                and func.attr in lambda_attrs
+            ):
+                return True
+
     return False
 
 

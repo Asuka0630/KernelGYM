@@ -14,8 +14,94 @@ from kernelgym.config import settings
 logger = logging.getLogger("kernelgym.toolkit.kernelbench.profiling")
 
 
-def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling_result: Dict[str, Any]):
-    """Compute the coverage of the matched triton kernels in the profiling result."""
+def _safe_metric(evt: Any, names: Tuple[str, ...], default: float = 0.0) -> float:
+    for name in names:
+        if hasattr(evt, name):
+            value = getattr(evt, name)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _safe_int_metric(evt: Any, names: Tuple[str, ...], default: int = 0) -> int:
+    for name in names:
+        if hasattr(evt, name):
+            value = getattr(evt, name)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _is_memory_overhead_event(name: str) -> bool:
+    """Return True for allocation/initialization/copy events.
+
+    These events are real overhead and should remain visible in diagnostic
+    profiling, but they should not dilute the Stage-2 anti-hack signal. The
+    anti-hack check asks whether the submitted custom kernel ran meaningful
+    device work, not whether output allocation or zero-fill was expensive.
+    """
+    lowered = name.lower()
+    memory_tokens = (
+        "cudamalloc",
+        "cudafree",
+        "cudaalloc",
+        "cuda_free",
+        "cudamemset",
+        "cuda_memset",
+        "cudamemcpy",
+        "cuda_memcpy",
+        "memset",
+        "memcpy",
+        "aten::empty",
+        "aten::zeros",
+        "aten::zero_",
+        "aten::fill_",
+        "aten::copy_",
+        "allocation",
+        "allocator",
+    )
+    return any(token in lowered for token in memory_tokens)
+
+
+def _memory_stats() -> Dict[str, float]:
+    """Collect CUDA memory stats without affecting profiling decisions."""
+    memory_stats = {}
+    try:
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            memory_stats = {
+                "allocated_mb": torch.cuda.memory_allocated(device) / (1024 * 1024),
+                "reserved_mb": torch.cuda.memory_reserved(device) / (1024 * 1024),
+                "max_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024 * 1024),
+                "max_reserved_mb": torch.cuda.max_memory_reserved(device) / (1024 * 1024),
+            }
+    except Exception as e:
+        logger.warning(f"[Profiler] Failed to collect memory stats: {e}")
+    return memory_stats
+
+
+def compute_cuda_kernel_coverage(matched_cuda_kernels: List[str], profilling_result: Dict[str, Any]):
+    """Compute custom-kernel coverage from profiler CUDA/device events.
+
+    Stage-2 anti-hack uses this ratio as a device-time signal. Do not mix in
+    CPU-side allocator or high-level operator aggregate time here; operations
+    like ``aten::zeros`` can spend a long time allocating memory while the
+    custom CUDA kernel is still the real device-side work.
+    """
 
     def _matches_profiler_name(captured: str, profiler_name: str) -> bool:
         cap = captured.lower()
@@ -26,40 +112,78 @@ def compute_triton_kernel_coverage(matched_triton_kernels: List[str], profilling
             return True
         return False
 
-    kernels = matched_triton_kernels
+    kernels = matched_cuda_kernels
     num_custom_kernels = 0
     kernel_names = [kernel.split(" ")[0] for kernel in kernels]
 
     kernels_in_profiling = profilling_result["kernels"]
+    use_device_events = any(
+        bool(prof_kernel.get("is_cuda_device_event", False))
+        for prof_kernel in kernels_in_profiling
+    )
+    use_self_cuda_time = any(
+        float(prof_kernel.get("self_cuda_time_us", 0.0) or 0.0) > 0.0
+        for prof_kernel in kernels_in_profiling
+    )
 
     total_time = 0.0
+    anti_hack_total_time = 0.0
     matched_cuda_time = 0.0
-    triton_kernels_in_profiling = []
+    num_total_kernels = 0
+    anti_hack_num_total_kernels = 0
+    cuda_kernels_in_profiling = []
+    memory_overhead_kernels_in_profiling = []
 
     for prof_kernel in kernels_in_profiling:
-        prof_name = prof_kernel["name"]
-        cuda_time = float(prof_kernel["cuda_time_us"])
-        cpu_time = float(prof_kernel["cpu_time_us"])
-        total_time += cuda_time + cpu_time
+        if use_device_events and not bool(prof_kernel.get("is_cuda_device_event", False)):
+            continue
 
-        if any(_matches_profiler_name(kernel_name, prof_name) for kernel_name in kernel_names):
-            triton_kernels_in_profiling.append(prof_name)
+        prof_name = prof_kernel["name"]
+        is_custom_kernel = any(
+            _matches_profiler_name(kernel_name, prof_name) for kernel_name in kernel_names
+        )
+        self_cuda_time = float(prof_kernel.get("self_cuda_time_us", 0.0) or 0.0)
+        total_cuda_time = float(prof_kernel.get("cuda_time_us", 0.0) or 0.0)
+        if use_self_cuda_time:
+            cuda_time = self_cuda_time
+            if cuda_time <= 0.0 and use_device_events:
+                cuda_time = total_cuda_time
+        else:
+            cuda_time = total_cuda_time
+        if cuda_time <= 0.0:
+            continue
+
+        total_time += cuda_time
+        num_total_kernels += 1
+        is_memory_overhead = _is_memory_overhead_event(prof_name)
+        if is_custom_kernel or not is_memory_overhead:
+            anti_hack_total_time += cuda_time
+            anti_hack_num_total_kernels += 1
+        elif is_memory_overhead:
+            memory_overhead_kernels_in_profiling.append(prof_name)
+
+        if is_custom_kernel:
+            cuda_kernels_in_profiling.append(prof_name)
             num_custom_kernels += 1
             matched_cuda_time += cuda_time
 
-    triton_kernels_not_in_profiling = [
+    cuda_kernels_not_in_profiling = [
         kernel_name
         for kernel_name in kernel_names
-        if not any(_matches_profiler_name(kernel_name, prof_name) for prof_name in triton_kernels_in_profiling)
+        if not any(_matches_profiler_name(kernel_name, prof_name) for prof_name in cuda_kernels_in_profiling)
     ]
 
     return {
         "num_custom_kernels": num_custom_kernels,
-        "num_total_kernels": len(kernels_in_profiling),
+        "num_total_kernels": num_total_kernels,
+        "anti_hack_num_total_kernels": anti_hack_num_total_kernels,
         "total_kernel_run_time_in_profiling_us": total_time,
+        "anti_hack_total_kernel_run_time_in_profiling_us": anti_hack_total_time,
         "custom_kernel_cuda_time_in_profiling_us": matched_cuda_time,
-        "triton_kernels_not_in_profiling": triton_kernels_not_in_profiling,
-        "triton_kernels_in_profiling": triton_kernels_in_profiling,
+        "memory_overhead_kernels_in_profiling": memory_overhead_kernels_in_profiling,
+        "cuda_kernels_not_in_profiling": cuda_kernels_not_in_profiling,
+        "cuda_kernels_in_profiling": cuda_kernels_in_profiling,
+        "profiling_time_basis": "self_cuda_time_us" if use_self_cuda_time else "cuda_time_us",
     }
 
 
@@ -168,37 +292,7 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
 
         logger.debug(f"[Profiler] Captured {total_events} total events")
 
-        def _safe_metric(evt: Any, names: Tuple[str, ...], default: float = 0.0) -> float:
-            for name in names:
-                if hasattr(evt, name):
-                    value = getattr(evt, name)
-                    if callable(value):
-                        try:
-                            value = value()
-                        except Exception:
-                            continue
-                    try:
-                        return float(value)
-                    except (TypeError, ValueError):
-                        continue
-            return default
-
-        def _safe_int_metric(evt: Any, names: Tuple[str, ...], default: int = 0) -> int:
-            for name in names:
-                if hasattr(evt, name):
-                    value = getattr(evt, name)
-                    if callable(value):
-                        try:
-                            value = value()
-                        except Exception:
-                            continue
-                    try:
-                        return int(value)
-                    except (TypeError, ValueError):
-                        continue
-            return default
-
-        cuda_kernels = []
+        cuda_entries = []
         total_cpu_time = 0.0
         total_self_cuda_time = 0.0
         for evt in events:
@@ -212,33 +306,46 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
             )
             self_cuda_time_us = _safe_metric(
                 evt,
-                ("self_cuda_time_total", "self_cuda_time"),
+                ("self_device_time_total", "self_cuda_time_total", "self_cuda_time"),
                 0.0,
             )
             if self_cuda_time_us > 0.0:
                 self_cuda_time_event_count += 1
                 total_self_cuda_time += self_cuda_time_us
-            if cuda_time_us <= 0.0:
+            if cuda_time_us <= 0.0 and self_cuda_time_us <= 0.0:
                 continue
             device_type = getattr(evt, "device_type", None)
-            if device_type is not None and device_type != profiler.DeviceType.CUDA:
-                pass
-            elif device_type == profiler.DeviceType.CUDA:
+            is_cuda_device_event = device_type == profiler.DeviceType.CUDA
+            if is_cuda_device_event:
                 cuda_device_event_count += 1
             cuda_time_event_count += 1
 
             kernel_entry = {
                 "name": getattr(evt, "key", "unknown"),
                 "cuda_time_us": cuda_time_us,
+                "self_cuda_time_us": self_cuda_time_us,
                 "cpu_time_us": cpu_time_us,
                 "count": _safe_int_metric(evt, ("count",), 0),
+                "is_cuda_device_event": is_cuda_device_event,
             }
+            if device_type is not None:
+                kernel_entry["device_type"] = str(device_type)
             memory_usage = _safe_metric(evt, ("cuda_memory_usage",), 0.0)
             if memory_usage > 0.0:
                 kernel_entry["cuda_memory_usage"] = memory_usage
-            cuda_kernels.append(kernel_entry)
+            cuda_entries.append(kernel_entry)
 
-        cuda_kernels.sort(key=lambda x: x["cuda_time_us"], reverse=True)
+        cuda_device_entries = [
+            entry for entry in cuda_entries if entry["is_cuda_device_event"]
+        ]
+        cuda_kernels = cuda_device_entries or cuda_entries
+        cuda_kernels.sort(
+            key=lambda x: max(
+                float(x.get("self_cuda_time_us", 0.0)),
+                float(x["cuda_time_us"]),
+            ),
+            reverse=True,
+        )
 
         logger.debug(
             f"[Profiler] Filtered to {len(cuda_kernels)} CUDA kernels (from {len(events)} total)"
@@ -247,19 +354,6 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
             logger.warning(
                 f"[Profiler] Captured events but no CUDA kernels! Event types: {[getattr(evt, 'device_type', 'unknown') for evt in list(events)[:5]]}"
             )
-
-        memory_stats = {}
-        try:
-            if torch.cuda.is_available():
-                device = torch.cuda.current_device()
-                memory_stats = {
-                    "allocated_mb": torch.cuda.memory_allocated(device) / (1024 * 1024),
-                    "reserved_mb": torch.cuda.memory_reserved(device) / (1024 * 1024),
-                    "max_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024 * 1024),
-                    "max_reserved_mb": torch.cuda.max_memory_reserved(device) / (1024 * 1024),
-                }
-        except Exception as e:
-            logger.warning(f"[Profiler] Failed to collect memory stats: {e}")
 
         profiling_metrics = {
             "kernels": cuda_kernels,
@@ -270,7 +364,7 @@ def extract_profiling_metrics(prof: Optional["torch.profiler.profile"]) -> Dict[
             "cuda_device_event_count": cuda_device_event_count,
             "cuda_time_event_count": cuda_time_event_count,
             "self_cuda_time_event_count": self_cuda_time_event_count,
-            "memory_stats": memory_stats,
+            "memory_stats": _memory_stats(),
         }
 
         if len(cuda_kernels) == 0:

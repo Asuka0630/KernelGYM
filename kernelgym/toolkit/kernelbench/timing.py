@@ -133,6 +133,56 @@ def time_execution_with_cuda_event(
     return elapsed_times, profiling_metrics
 
 
+def run_anti_hack_profiling(
+    kernel_fn: callable,
+    *args,
+    num_trials: int = 3,
+    verbose: bool = False,
+    device: torch.device = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated *light* profiling pass for Stage-2 anti-hack coverage.
+
+    Mirrors the light-profiling branch of ``time_execution_with_cuda_event``
+    but runs **no timing trials** — it exists purely to collect kernel-level
+    profiling metrics (custom-kernel coverage / CUDA-time ratio) *before* the
+    performance timing step, so that timing and profiling are fully decoupled.
+
+    Returns the extracted profiling metrics dict (possibly empty / with a
+    ``profiling_error`` key on failure). Phase wall-time is accumulated under
+    ``metadata['phase_timings_ms']['anti_hack.profiling_inline']``.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+
+    profiling_metrics: Dict[str, Any] = {}
+    _prof_start = time.perf_counter()
+    try:
+        torch.cuda.synchronize(device=device)
+        print(
+            f"[Profiling] Running {num_trials} iterations for anti-hack "
+            f"profiling (light)..."
+        )
+        with profiling_context(True, light=True) as prof:
+            for _ in range(num_trials):
+                kernel_fn(*args)
+            torch.cuda.synchronize(device=device)
+        profiling_metrics = extract_profiling_metrics(prof)
+        if profiling_metrics:
+            print(
+                f"[Profiling] Captured {profiling_metrics.get('kernel_count', 0)} CUDA kernels"
+            )
+    except Exception as e:
+        print(f"[Profiling] Warning: anti-hack profiling failed: {e}")
+        profiling_metrics = {"profiling_error": str(e)}
+    finally:
+        _record_phase_ms(
+            metadata, "anti_hack.profiling_inline", time.perf_counter() - _prof_start
+        )
+
+    return profiling_metrics
+
+
 def run_profiling_only(
     kernel_fn: callable,
     *args,

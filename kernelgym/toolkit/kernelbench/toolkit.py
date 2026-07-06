@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 import torch
@@ -23,6 +24,29 @@ from kernelgym.toolkit.kernelbench import pipeline as kernelbench_pipeline
 
 from ..base import Toolkit
 
+logger = logging.getLogger(__name__)
+
+_ENABLE_PROFILING_DEPRECATION_WARNED = False
+
+
+def _warn_enable_profiling_deprecated(value: Any) -> None:
+    """Emit a one-time deprecation warning for the ``enable_profiling`` flag.
+
+    ``enable_profiling`` is no longer used by the kernelbench evaluation
+    pipeline: profiling is now performed inside the dynamic anti-hack stage
+    (gated by ``enable_anti_hack``). The flag is accepted for backward
+    compatibility but ignored.
+    """
+    global _ENABLE_PROFILING_DEPRECATION_WARNED
+    if value is not None and not _ENABLE_PROFILING_DEPRECATION_WARNED:
+        logger.warning(
+            "`enable_profiling` is deprecated for the kernelbench evaluation "
+            "path and is now a no-op. Profiling/coverage is produced by the "
+            "dynamic anti-hack stage (gated by `enable_anti_hack`); the "
+            "`enable_profiling` flag is ignored."
+        )
+        _ENABLE_PROFILING_DEPRECATION_WARNED = True
+
 
 class KernelBenchToolkit(Toolkit):
     """Toolkit adapter around KernelBench evaluation."""
@@ -32,16 +56,10 @@ class KernelBenchToolkit(Toolkit):
     def __init__(self) -> None:
         pass
 
-    def _resolve_eval_flags(self, task: Any) -> tuple[bool, bool, bool]:
+    def _resolve_eval_flags(self, task: Any) -> tuple[bool, bool]:
         run_correctness = task.run_correctness
         if run_correctness is None:
             run_correctness = True
-
-        run_triton_detection = task.run_triton_detection
-        if run_triton_detection is None:
-            run_triton_detection = task.enable_triton_detection
-        if run_triton_detection is None:
-            run_triton_detection = task.backend == "triton"
 
         run_performance = task.run_performance
         if run_performance is None:
@@ -49,10 +67,15 @@ class KernelBenchToolkit(Toolkit):
         if run_performance is None:
             run_performance = True
 
-        return run_correctness, run_triton_detection, run_performance
+        return run_correctness, run_performance
 
     def evaluate(self, task: Dict[str, Any], backend=None, **kwargs: Any) -> Dict[str, Any]:
         task_type = task.get("task_type", "evaluation")
+        # ``enable_profiling`` is deprecated (no-op) on the kernelbench path:
+        # profiling now runs inside the dynamic anti-hack stage. Warn once if a
+        # caller still sets it explicitly.
+        if task.get("enable_profiling") is not None:
+            _warn_enable_profiling_deprecated(task.get("enable_profiling"))
         # The off-GPU compile pipeline (kernelgym.worker.compile_service)
         # attaches its stage-1 artifact + build_dir directly to the task
         # payload. Forward those into the typed helpers so the pipeline can
@@ -75,7 +98,6 @@ class KernelBenchToolkit(Toolkit):
             result = self.evaluate_kernel_only(
                 KernelEvaluationTask.from_dict(task),
                 verbose_errors=task.get("verbose_errors", True),
-                enable_profiling=task.get("enable_profiling", settings.enable_profiling),
                 backend_adapter=backend,
                 precompiled_artifact=precompiled_artifact,
                 attached_build_dir=attached_build_dir,
@@ -130,12 +152,8 @@ class KernelBenchToolkit(Toolkit):
         try:
             set_seed(42)
 
-            run_correctness, enable_triton_detection, measure_performance = self._resolve_eval_flags(task)
+            run_correctness, measure_performance = self._resolve_eval_flags(task)
             num_correct_trials = task.num_correct_trials if run_correctness else 0
-
-            enable_profiling = task.enable_profiling
-            if enable_profiling is None:
-                enable_profiling = settings.enable_profiling
 
             result = kernelbench_pipeline.eval_kernel_against_ref(
                 original_model_src=task.reference_code,
@@ -148,8 +166,6 @@ class KernelBenchToolkit(Toolkit):
                 device=device,
                 backend=task.backend,
                 entry_point=task.entry_point,
-                enable_profiling=bool(enable_profiling),
-                enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
                 build_dir=attached_build_dir,
                 precompiled_artifact=precompiled_artifact,
@@ -168,7 +184,7 @@ class KernelBenchToolkit(Toolkit):
                 anti_hack_ratio_min=(
                     float(task.anti_hack_ratio_min)
                     if task.anti_hack_ratio_min is not None
-                    else 0.02
+                    else 0.50
                 ),
                 anti_hack_profiling_trials=(
                     int(task.anti_hack_profiling_trials)
@@ -300,7 +316,6 @@ class KernelBenchToolkit(Toolkit):
         self,
         task: KernelEvaluationTask,
         verbose_errors: bool = True,
-        enable_profiling: bool = False,
         backend_adapter=None,
         precompiled_artifact: Optional[Dict[str, Any]] = None,
         attached_build_dir: Optional[str] = None,
@@ -341,7 +356,7 @@ class KernelBenchToolkit(Toolkit):
         try:
             set_seed(42)
 
-            run_correctness, enable_triton_detection, measure_performance = self._resolve_eval_flags(task)
+            run_correctness, measure_performance = self._resolve_eval_flags(task)
             num_correct_trials = task.num_correct_trials if run_correctness else 0
 
             result = kernelbench_pipeline.eval_kernel_against_ref(
@@ -355,8 +370,6 @@ class KernelBenchToolkit(Toolkit):
                 device=device,
                 backend=task.backend,
                 entry_point=task.entry_point,
-                enable_profiling=enable_profiling,
-                enable_triton_detection=enable_triton_detection,
                 backend_adapter=backend_adapter,
                 build_dir=attached_build_dir,
                 precompiled_artifact=precompiled_artifact,
@@ -375,7 +388,7 @@ class KernelBenchToolkit(Toolkit):
                 anti_hack_ratio_min=(
                     float(task.anti_hack_ratio_min)
                     if task.anti_hack_ratio_min is not None
-                    else 0.02
+                    else 0.50
                 ),
                 anti_hack_profiling_trials=(
                     int(task.anti_hack_profiling_trials)
@@ -401,13 +414,6 @@ class KernelBenchToolkit(Toolkit):
                     "num_warmup": task.num_warmup,
                 }
             )
-
-            if enable_profiling and "profiling" in result.metadata:
-                profiling_metrics = result.metadata["profiling"]
-                if profiling_metrics:
-                    print(
-                        f"[DEBUG] Profiling captured {profiling_metrics.get('kernel_count', 0)} kernels"
-                    )
 
             return KernelEvaluationResult.from_kernel_exec_result(
                 task.task_id, task.base_task_id, result

@@ -132,10 +132,10 @@ class EvaluationRequest(BaseModel):
                     "anti-hack entirely for this request.",
     )
     anti_hack_ratio_min: Optional[float] = Field(
-        default=0.02,
+        default=0.50,
         ge=0.0, le=1.0,
         description="Custom-kernel time ratio below which the kernel is marked "
-                    "decoy in Stage 2 (default 0.02 = 2%).",
+                    "decoy in Stage 2 (default 0.50 = 50%).",
     )
     anti_hack_profiling_trials: Optional[int] = Field(
         default=3,

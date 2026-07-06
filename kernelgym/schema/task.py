@@ -40,7 +40,7 @@ class EvaluationTask:
     kernel_names: Optional[List[str]] = None
     # Anti-hack decoy detection (per-request)
     enable_anti_hack: Optional[bool] = True
-    anti_hack_ratio_min: Optional[float] = 0.02
+    anti_hack_ratio_min: Optional[float] = 0.50
     anti_hack_profiling_trials: Optional[int] = 3
     resources: Optional[Dict[str, Any]] = None
 
@@ -110,7 +110,7 @@ class KernelEvaluationTask:
     kernel_names: Optional[List[str]] = None
     # Anti-hack decoy detection (per-request)
     enable_anti_hack: Optional[bool] = True
-    anti_hack_ratio_min: Optional[float] = 0.02
+    anti_hack_ratio_min: Optional[float] = 0.50
     anti_hack_profiling_trials: Optional[int] = 3
     resources: Optional[Dict[str, Any]] = None
 
