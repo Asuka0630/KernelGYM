@@ -107,11 +107,8 @@ def profiling_context(enabled: bool = True):
                 except Exception as e:
                     device_info = f"cuda:unknown (error={e})"
             print(
-                "[Profiler] Context pid=%s cuda_available=%s device=%s CUDA_VISIBLE_DEVICES=%s",
-                os.getpid(),
-                cuda_available,
-                device_info,
-                cuda_visible,
+                f"[Profiler] Context pid={os.getpid()} cuda_available={cuda_available}",
+                f" device={device_info} CUDA_VISIBLE_DEVICES={cuda_visible}",
             )
             if cuda_available:
                 try:

@@ -7,6 +7,48 @@ from pydantic import BaseModel, Field, root_validator, validator
 from kernelgym.common import TaskStatus, Backend, Priority, ErrorCode
 
 
+# ---------------------------------------------------------------------------
+# Device info — GET /device_info response
+# ---------------------------------------------------------------------------
+class DeviceMemoryInfo(BaseModel):
+    total_gb: float
+    dram_bandwidth_gb_s: Optional[float] = None
+    l2_cache_mb: Optional[float] = None
+
+
+class DevicePerSMInfo(BaseModel):
+    shared_memory_kb: float
+    registers: int
+    max_warps: Optional[int] = None
+    max_blocks: Optional[int] = None
+
+
+class DevicePeakTflops(BaseModel):
+    f32_cuda_core: Optional[float] = None
+    f32_tensor_core: Optional[float] = None
+    f16_cuda_core: Optional[float] = None
+    f16_tensor_core: Optional[float] = None
+
+
+class DeviceLimits(BaseModel):
+    max_threads_per_block: Optional[int] = None
+    max_block_dim: Optional[List[int]] = None
+    max_grid_dim: Optional[List[int]] = None
+    warp_size: int
+
+
+class DeviceInfoResponse(BaseModel):
+    name: str
+    compute_capability: str
+    num_sms: int
+    memory: DeviceMemoryInfo
+    per_sm: DevicePerSMInfo
+    peak_tflops: DevicePeakTflops
+    limits: DeviceLimits
+    warning: Optional[str] = None
+    device_index: int = 0
+
+
 class EvaluationRequest(BaseModel):
     """Request model for kernel evaluation."""
 
@@ -67,6 +109,27 @@ class EvaluationRequest(BaseModel):
         description="If True, skip the reference timing task entirely. "
                     "Returned reference_runtime/speedup will be -1/0; useful for "
                     "benchmarking the kernel-evaluation path itself.",
+    )
+    enable_ncu: Optional[bool] = Field(
+        default=None,
+        description="Enable Nsight Compute (ncu) profiling for this request. "
+                    "When True (and correctness passes), the server runs ncu against "
+                    "the custom kernels and attaches a structured summary "
+                    "(key_metrics + Top-K rule suggestions) under metadata.ncu. "
+                    "None or False = NCU is skipped.",
+    )
+    ncu_top_k_rules: Optional[int] = Field(
+        default=5,
+        ge=1, le=20,
+        description="Number of Top-K NCU rule suggestions to keep, sorted by "
+                    "estimated speedup. Ignored when enable_ncu is False.",
+    )
+    kernel_names: Optional[List[str]] = Field(
+        default=None,
+        description="Explicit list of __global__ kernel names to profile with "
+                    "ncu -k 'regex:^(...)$'. When None, the server falls back to "
+                    "extracting names from kernel_code via regex. Used to keep ncu "
+                    "from profiling cuBLAS / cuDNN / PyTorch eager kernels.",
     )
     cases_code: Optional[str] = Field(
         default=None,

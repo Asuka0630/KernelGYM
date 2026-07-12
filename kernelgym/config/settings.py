@@ -2,13 +2,60 @@
 
 import os
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Annotated
 
-from pydantic import Field, validator
+from pydantic import Field, validator, BeforeValidator
 from pydantic_settings import BaseSettings
+from pydantic_settings.sources.types import NoDecode
 
 PROJECT_ROOT = Path(__file__).parent.parent
 KERNELBENCH_ROOT = PROJECT_ROOT.parent
+
+
+def _parse_str_list(v: str, default: List[str]) -> List[str]:
+    """Parse a JSON / Python-literal array, or comma-separated string.
+
+    Tries, in order:
+      1. ``json.loads``      — handles  ``["-lineinfo"]``
+      2. ``ast.literal_eval`` — handles  ``['-lineinfo']`` (Python literal, safe in .env)
+      3. comma-split          — handles  ``-lineinfo``, ``-O3,-lineinfo``,
+                                 or ``[-lineinfo]`` (shell-stripped JSON)
+    """
+    v = v.strip()
+    if not v:
+        return list(default)
+    try:
+        import json
+        return json.loads(v)
+    except json.JSONDecodeError:
+        pass
+    try:
+        import ast
+        return ast.literal_eval(v)
+    except (ValueError, SyntaxError):
+        pass
+    # Bare brackets from shell-stripped JSON (export FOO="[\"val\"]" → FOO=[val])
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    return [f.strip().strip('"').strip("'") for f in v.split(",") if f.strip()]
+
+
+def _parse_str_list_or_comma(v: Any) -> List[str]:
+    """Parse a JSON/Python array or comma-separated string into a list of strings."""
+    if isinstance(v, str):
+        return _parse_str_list(v, default=[])
+    if isinstance(v, list):
+        return v
+    return []
+
+
+def _parse_ncu_extra_cflags(v: Any) -> List[str]:
+    """Parse NCU_EXTRA_CFLAGS — defaults to ['-lineinfo'] when empty."""
+    if isinstance(v, str):
+        return _parse_str_list(v, default=["-lineinfo"])
+    if isinstance(v, list):
+        return v
+    return ["-lineinfo"]
 
 
 class Settings(BaseSettings):
@@ -86,6 +133,39 @@ class Settings(BaseSettings):
         default=1,
         env="PROFILING_RETRY_COUNT",
         description="Retry count when profiler returns empty results (0 to disable).",
+    )
+
+    # ------------------------------------------------------------------
+    # NCU (Nsight Compute) profiling — runs ``ncu --set <ncu_set>`` against
+    # custom CUDA kernels after correctness passes, attaches a structured
+    # summary (key metrics + Top-K rule suggestions) to the response
+    # under ``metadata.ncu``. Strictly opt-in per request via
+    # ``EvaluationRequest.enable_ncu`` (no global enable switch).
+    # ------------------------------------------------------------------
+    ncu_set: str = Field(
+        default="full",
+        env="NCU_SET",
+        description="Nsight Compute --set value (full | detailed | basic | source).",
+    )
+    ncu_timeout_sec: int = Field(
+        default=180,
+        env="NCU_TIMEOUT_SEC",
+        description="Wall-clock timeout for the ncu subprocess (seconds).",
+    )
+    ncu_top_k_rules: int = Field(
+        default=5,
+        env="NCU_TOP_K_RULES",
+        description="Top-K NCU rule suggestions (sorted by estimated speedup) attached to metadata.ncu.",
+    )
+    ncu_python_extra_paths: Annotated[List[str], NoDecode, BeforeValidator(_parse_str_list_or_comma)] = Field(
+        default_factory=list,
+        description="Extra sys.path entries to locate the ncu_report Python module "
+                    "(e.g. /usr/local/cuda/nsight-compute-XXXX.X.X/extras/python).",
+    )
+    ncu_extra_cflags: Annotated[List[str], NoDecode, BeforeValidator(_parse_ncu_extra_cflags)] = Field(
+        default_factory=lambda: ["-lineinfo"],
+        description="Extra nvcc cflags injected into torch load_inline when NCU is enabled "
+                    "(at minimum -lineinfo so source-level metrics map back to source).",
     )
 
     reference_cache_dataset_path: str = Field(default="", env="REFERENCE_CACHE_DATASET_PATH")
