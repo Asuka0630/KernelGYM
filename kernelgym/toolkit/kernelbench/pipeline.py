@@ -18,7 +18,6 @@ import torch
 
 from kernelgym.config import settings
 from kernelgym.phase_state import enter_phase
-from kernelgym.toolkit.kernelbench import triton_detect as detect
 from kernelgym.toolkit.kernelbench.exec_types import KernelExecResult, get_error_name, set_seed
 from kernelgym.toolkit.kernelbench.loading import (
     graceful_eval_cleanup,
@@ -27,9 +26,10 @@ from kernelgym.toolkit.kernelbench.loading import (
     load_original_model_and_inputs,
 )
 from kernelgym.toolkit.kernelbench.correctness import run_and_check_correctness
-from kernelgym.toolkit.kernelbench.profiling import compute_triton_kernel_coverage
+from kernelgym.toolkit.kernelbench.profiling import compute_cuda_kernel_coverage
 from kernelgym.toolkit.kernelbench.timing import (
     get_timing_stats,
+    run_anti_hack_profiling,
     run_profiling_only,
     time_execution_with_cuda_event,
 )
@@ -107,6 +107,26 @@ def _record_memory_peak(
         _merge_into(kernel_exec_result.metadata)
 
 
+def _mark_decoy(
+    kernel_exec_result: KernelExecResult,
+    metadata: Dict[str, Any],
+    *,
+    reason: str,
+    detection: str,
+) -> None:
+    """Mark a result as decoy with a user-facing reason classification.
+
+    ``anti_hack_reason`` names what is wrong with the kernel.  The detection
+    mechanism is kept separately so downstream consumers do not need to parse
+    implementation details like "ast" or "profiling" from the reason.
+    """
+    kernel_exec_result.decoy_kernel = True
+    kernel_exec_result.metadata["anti_hack_reason"] = reason
+    kernel_exec_result.metadata["anti_hack_detection"] = detection
+    metadata["anti_hack_reason"] = reason
+    metadata["anti_hack_detection"] = detection
+
+
 def _run_correctness_step(
     original_model,
     custom_model,
@@ -141,66 +161,14 @@ def _run_correctness_step(
         return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
 
-def _run_triton_detection_step(
-    *,
-    enable_triton_detection: bool,
-    is_triton: bool,
-    kernel_exec_result: KernelExecResult,
-    custom_model,
-    get_inputs,
-    metadata: Dict[str, Any],
-    seed_num: int,
-    device: Union[torch.device, int],
-    verbose: bool,
-    backend: str,
-):
-    if not enable_triton_detection:
-        return False
-    _phase_start = time.perf_counter()
-    try:
-        try:
-            print("Begin Triton usage detection")
-            if kernel_exec_result and kernel_exec_result.correctness:
-                torch.cuda.synchronize(device=device)
-                set_seed(seed_num)
-                inputs = get_inputs()
-                inputs = [
-                    x.cuda(device=device) if isinstance(x, torch.Tensor) else x
-                    for x in inputs
-                ]
-                model_new = custom_model.cuda(device=device)
-                torch.cuda.synchronize(device=device)
-
-                used, matches = detect.detect_triton_usage_for_module(
-                    model_new,
-                    *inputs,
-                    warmup=1,
-                    steps=1,
-                    use_cuda=True,
-                    return_matches=True,
-                )
-                metadata["triton_profiler_used"] = used
-                metadata["triton_profiler_matches"] = matches
-                print(f"Triton usage detection result: {used}")
-                print(f"Triton usage detection matches: {matches}")
-                if not used and is_triton:
-                    print(
-                        "[Eval] Backend is 'triton' but no Triton usage detected, marking as decoy"
-                    )
-                    kernel_exec_result.decoy_kernel = True
-                    kernel_exec_result.runtime = -1.0
-                    return True
-                    if not used:
-                        print(
-                            f"[Eval] No Triton usage detected, but backend is '{backend}', continuing to performance measurement"
-                        )
-        except Exception as e:
-            if verbose:
-                print(f"[Eval] Error in Triton usage detection: {e}")
-            metadata["error_in_triton_detection"] = e
-        return False
-    finally:
-        _record_phase(metadata, "triton_detect", time.perf_counter() - _phase_start)
+def _profiling_empty(metrics: Dict[str, Any]) -> bool:
+    if not metrics:
+        return True
+    if "kernels" not in metrics:
+        return True
+    if len(metrics.get("kernels", [])) == 0:
+        return True
+    return False
 
 
 def _run_performance_step(
@@ -214,251 +182,356 @@ def _run_performance_step(
     verbose: bool,
     seed_num: int,
     device: Union[torch.device, int],
-    enable_profiling: bool,
 ):
+    """Measure kernel runtime with CUDA events — pure timing, no profiling.
+
+    Profiling / coverage / Stage-2 anti-hack run *before* this step in
+    :func:`_run_dynamic_anti_hack_step`, so the performance measurement is a
+    clean CUDA-event timing loop with zero profiler overhead. Only runs when
+    the kernel compiled and passed correctness.
+    """
     enter_phase("performance")
     _perf_phase_start = time.perf_counter()
     try:
-        _run_performance_step_impl(
-            kernel_exec_result=kernel_exec_result,
-            custom_model=custom_model,
-            get_inputs=get_inputs,
-            metadata=metadata,
-            num_perf_trials=num_perf_trials,
-            num_warmup=num_warmup,
-            verbose=verbose,
-            seed_num=seed_num,
-            device=device,
-            enable_profiling=enable_profiling,
-        )
+        if not (kernel_exec_result and kernel_exec_result.correctness):
+            return
+        if verbose:
+            print("[Eval] Measuring Performance as Sample is Correct")
+
+        with _timed(metadata, "performance.input_setup"):
+            torch.cuda.synchronize(device=device)
+            set_seed(seed_num)
+            inputs = get_inputs()
+            inputs = [
+                x.cuda(device=device) if isinstance(x, torch.Tensor) else x
+                for x in inputs
+            ]
+            model_new = custom_model.cuda(device=device)
+            torch.cuda.synchronize(device=device)
+
+        with _timed(metadata, "performance.measure"):
+            elapsed_times, _ = time_execution_with_cuda_event(
+                model_new,
+                *inputs,
+                num_warmup=num_warmup,
+                num_trials=num_perf_trials,
+                verbose=verbose,
+                device=device,
+                enable_profiling=False,
+                metadata=metadata,
+                enable_anti_hack=False,
+            )
+        runtime_stats = get_timing_stats(elapsed_times, device=device)
+
+        if verbose:
+            print(f"[Eval] Performance Stats: {runtime_stats}")
+        kernel_exec_result.runtime = runtime_stats["mean"]
+        kernel_exec_result.runtime_stats = runtime_stats
+    except Exception as e:
+        if verbose:
+            print(f"[Eval] Error in Measuring Performance: {e}")
+        kernel_exec_result.metadata["error_during_performance"] = capture_runtime_error(e)
     finally:
         _record_phase(metadata, "performance", time.perf_counter() - _perf_phase_start)
 
 
-def _run_performance_step_impl(
+def _run_dynamic_anti_hack_step(
     *,
     kernel_exec_result: KernelExecResult,
     custom_model,
     get_inputs,
     metadata: Dict[str, Any],
-    num_perf_trials: int,
-    num_warmup: int,
     verbose: bool,
     seed_num: int,
     device: Union[torch.device, int],
-    enable_profiling: bool,
-):
-    def _profiling_empty(metrics: Dict[str, Any]) -> bool:
-        if not metrics:
-            return True
-        if "kernels" not in metrics:
-            return True
-        if len(metrics.get("kernels", [])) == 0:
-            return True
+    anti_hack_trials: int = 3,
+    anti_hack_ratio_min: float = 0.50,
+) -> bool:
+    """Stage-2 dynamic anti-hack: dedicated light profiling + coverage ratio.
+
+    Decoupled from performance timing — runs its own *light* profiling pass,
+    computes custom-kernel coverage / CUDA-time ratio, attaches the profiling
+    metadata, and applies ratio-based decoy detection.
+
+    Returns True if the kernel was marked decoy (caller must then skip
+    performance + NCU). Only runs when the kernel passed correctness.
+    """
+    if not (kernel_exec_result and kernel_exec_result.correctness):
         return False
 
+    enter_phase("anti_hack")
+    _phase_start = time.perf_counter()
     try:
-        if kernel_exec_result and kernel_exec_result.correctness:
-            if verbose:
-                print("[Eval] Measuring Performance as Sample is Correct")
+        with _timed(metadata, "anti_hack.input_setup"):
+            torch.cuda.synchronize(device=device)
+            set_seed(seed_num)
+            inputs = get_inputs()
+            inputs = [
+                x.cuda(device=device) if isinstance(x, torch.Tensor) else x
+                for x in inputs
+            ]
+            model_new = custom_model.cuda(device=device)
+            torch.cuda.synchronize(device=device)
 
-            with _timed(metadata, "performance.input_setup"):
-                torch.cuda.synchronize(device=device)
-                set_seed(seed_num)
-                inputs = get_inputs()
-                inputs = [
-                    x.cuda(device=device) if isinstance(x, torch.Tensor) else x
-                    for x in inputs
-                ]
-                model_new = custom_model.cuda(device=device)
-                torch.cuda.synchronize(device=device)
-
-            with _timed(metadata, "performance.measure"):
-                elapsed_times, profiling_metrics = time_execution_with_cuda_event(
-                    model_new,
-                    *inputs,
-                    num_warmup=num_warmup,
-                    num_trials=num_perf_trials,
-                    verbose=verbose,
-                    device=device,
-                    enable_profiling=enable_profiling,
-                    metadata=metadata,
-                )
-            runtime_stats = get_timing_stats(elapsed_times, device=device)
-
-            if enable_profiling and _profiling_empty(profiling_metrics):
-                with _timed(metadata, "performance.profiling_retry"):
-                    retry_count = max(0, int(getattr(settings, "profiling_retry_count", 0)))
-                    for attempt in range(retry_count):
-                        print(
-                            f"[WARNING] Profiler returned empty results. Retrying ({attempt + 1}/{retry_count})..."
-                        )
-                        retry_metrics = run_profiling_only(
-                            model_new,
-                            *inputs,
-                            num_trials=max(1, min(num_perf_trials, 10)),
-                            verbose=verbose,
-                            device=device,
-                        )
-                        if not _profiling_empty(retry_metrics):
-                            profiling_metrics = retry_metrics
-                            break
-                        profiling_metrics = retry_metrics
-
-            with _timed(metadata, "performance.post_processing"):
-                if enable_profiling:
+        with _timed(metadata, "anti_hack.profiling"):
+            profiling_metrics = run_anti_hack_profiling(
+                model_new,
+                *inputs,
+                num_trials=anti_hack_trials,
+                verbose=verbose,
+                device=device,
+                metadata=metadata,
+            )
+            if _profiling_empty(profiling_metrics):
+                retry_count = max(0, int(getattr(settings, "profiling_retry_count", 0)))
+                for attempt in range(retry_count):
                     print(
-                        f"[DEBUG] profiling_metrics type: {type(profiling_metrics)}, empty: {not profiling_metrics}"
+                        f"[WARNING] Profiler returned empty results. Retrying ({attempt + 1}/{retry_count})..."
                     )
-                    if profiling_metrics.get("profiling_warning"):
-                        print(
-                            f"[WARNING] Profiling warning: {profiling_metrics['profiling_warning']}"
-                        )
-
-                    if _profiling_empty(profiling_metrics):
-                        print("[WARNING] Profiler returned empty results!")
-                        print(
-                            "[WARNING] This may be a profiler bug, not a decoy kernel issue."
-                        )
-                        print(
-                            f"[WARNING] Triton hook detected: {metadata.get('triton_profiler_used', False)}"
-                        )
-                        print(
-                            f"[WARNING] Triton matches: {len(metadata.get('triton_profiler_matches', []))}"
-                        )
-                        if metadata.get("triton_profiler_used", False):
-                            print(
-                                "[INFO] Skipping decoy detection due to profiler failure (Triton hook passed)"
-                            )
-
-                if profiling_metrics and len(profiling_metrics) > 0:
-                    metadata["profiling"] = profiling_metrics
-                    if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
-                        kernel_exec_result.metadata["profiling"] = profiling_metrics
-
-                    print(
-                        f"[DEBUG Profiling] profiling_metrics keys: {profiling_metrics.keys()}"
+                    retry_metrics = run_profiling_only(
+                        model_new,
+                        *inputs,
+                        num_trials=max(1, anti_hack_trials),
+                        verbose=verbose,
+                        device=device,
                     )
-                    print(
-                        f"[DEBUG Profiling] kernel_count: {profiling_metrics.get('kernel_count', 'N/A')}"
-                    )
-                    print(
-                        f"[DEBUG Profiling] triton_profiler_matches: {metadata.get('triton_profiler_matches', [])}"
-                    )
+                    profiling_metrics = retry_metrics
+                    if not _profiling_empty(retry_metrics):
+                        break
 
-                    try:
-                        coverage_result_dict = compute_triton_kernel_coverage(
-                            metadata.get("triton_profiler_matches", []), profiling_metrics
-                        )
-                    except Exception as coverage_error:
-                        print(
-                            f"[ERROR] compute_triton_kernel_coverage failed: {coverage_error}"
-                        )
-                        import traceback
-
-                        traceback.print_exc()
-                        coverage_result_dict = {
-                            "num_custom_kernels": 0,
-                            "num_total_kernels": 0,
-                            "triton_kernels_not_in_profiling": metadata.get(
-                                "triton_profiler_matches", []
-                            ),
-                            "triton_kernels_in_profiling": [],
-                            "total_kernel_run_time_in_profiling_us": 0,
-                            "custom_kernel_cuda_time_in_profiling_us": 0,
-                        }
-                    print(
-                        f"[DEBUG Coverage] num_custom_kernels: {coverage_result_dict['num_custom_kernels']}"
-                    )
-                    print(
-                        f"[DEBUG Coverage] num_total_kernels: {coverage_result_dict['num_total_kernels']}"
-                    )
-                    num_custom_kernels = coverage_result_dict["num_custom_kernels"]
-                    num_total_kernels = coverage_result_dict["num_total_kernels"]
-                    triton_kernels_not_in_profiling = coverage_result_dict[
-                        "triton_kernels_not_in_profiling"
-                    ]
-                    triton_kernels_in_profiling = coverage_result_dict[
-                        "triton_kernels_in_profiling"
-                    ]
-                    total_kernel_run_time_in_profiling_us = coverage_result_dict[
-                        "total_kernel_run_time_in_profiling_us"
-                    ]
-                    custom_kernel_cuda_time_in_profiling_us = coverage_result_dict[
-                        "custom_kernel_cuda_time_in_profiling_us"
-                    ]
-
-                    metadata["num_custom_kernels"] = num_custom_kernels
-                    metadata["num_total_kernels"] = num_total_kernels
-                    ratio = num_custom_kernels / num_total_kernels if num_total_kernels > 0 else 0
-                    metadata[
-                        "triton_kernel_coverage"
-                    ] = f"Run {num_custom_kernels} custom kernels / Total {num_total_kernels} kernels, Coverage: {ratio:.2%}"
-                    metadata["triton_kernel_not_in_profiling"] = (
-                        triton_kernels_not_in_profiling
-                    )
-                    metadata["triton_kernel_in_profiling"] = triton_kernels_in_profiling
-
-                    metadata[
-                        "total_kernel_run_time_in_profiling_us"
-                    ] = total_kernel_run_time_in_profiling_us
-                    metadata[
-                        "custom_kernel_cuda_time_in_profiling_us"
-                    ] = custom_kernel_cuda_time_in_profiling_us
-                    ratio_time = (
-                        custom_kernel_cuda_time_in_profiling_us
-                        / total_kernel_run_time_in_profiling_us
-                        if total_kernel_run_time_in_profiling_us > 0
-                        else 0
-                    )
-                    metadata[
-                        "custom_kernel_cuda_time_coverage"
-                    ] = (
-                        f"Custom kernel CUDA time: {custom_kernel_cuda_time_in_profiling_us:.2f}us / Total time: {total_kernel_run_time_in_profiling_us:.2f}us, Coverage: {ratio_time:.2%}"
-                    )
-
-                    if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
-                        kernel_exec_result.metadata["num_custom_kernels"] = num_custom_kernels
-                        kernel_exec_result.metadata["num_total_kernels"] = num_total_kernels
-                        kernel_exec_result.metadata[
-                            "triton_kernel_coverage"
-                        ] = f"Run {num_custom_kernels} custom kernels / Total {num_total_kernels} kernels, Coverage: {ratio:.2%}"
-                        kernel_exec_result.metadata["triton_profiler_matches"] = metadata.get(
-                            "triton_profiler_matches", []
-                        )
-
-                        kernel_exec_result.metadata[
-                            "custom_kernel_cuda_time_in_profiling_us"
-                        ] = custom_kernel_cuda_time_in_profiling_us
-                        kernel_exec_result.metadata[
-                            "total_kernel_run_time_in_profiling_us"
-                        ] = total_kernel_run_time_in_profiling_us
-                        kernel_exec_result.metadata[
-                            "custom_kernel_cuda_time_coverage"
-                        ] = (
-                            f"Custom kernel CUDA time: {custom_kernel_cuda_time_in_profiling_us:.2f}us / Total time: {total_kernel_run_time_in_profiling_us:.2f}us, Coverage: {ratio_time:.2%}"
-                        )
-
-                    if num_custom_kernels == 0 and num_total_kernels > 0:
-                        print(
-                            f"[WARNING] Profiler captured {num_total_kernels} kernels but 0 custom kernels - marking as decoy"
-                        )
-                        kernel_exec_result.decoy_kernel = True
-                    elif num_custom_kernels == 0 and num_total_kernels == 0:
-                        print(
-                            "[WARNING] Profiler captured 0 total kernels - likely profiler bug, NOT marking as decoy"
-                        )
-                        print(
-                            f"[INFO] Relying on Triton hook detection instead (detected: {metadata.get('triton_profiler_used', False)})"
-                        )
-                if verbose:
-                    print(f"[Eval] Performance Stats: {runtime_stats}")
-                kernel_exec_result.runtime = runtime_stats["mean"]
-                kernel_exec_result.runtime_stats = runtime_stats
+        with _timed(metadata, "anti_hack.coverage"):
+            return _process_profiling_coverage(
+                profiling_metrics=profiling_metrics,
+                kernel_exec_result=kernel_exec_result,
+                metadata=metadata,
+                anti_hack_ratio_min=anti_hack_ratio_min,
+                verbose=verbose,
+            )
     except Exception as e:
         if verbose:
-            print(f"[Eval] Error in Measuring Performance: {e}")
-        kernel_exec_result.metadata["error_during_performance"] = capture_runtime_error(e)
+            print(f"[Eval] Error in dynamic anti-hack: {e}")
+        kernel_exec_result.metadata["error_during_anti_hack"] = capture_runtime_error(e)
+        return False
+    finally:
+        _record_phase(metadata, "anti_hack", time.perf_counter() - _phase_start)
+
+
+def _process_profiling_coverage(
+    *,
+    profiling_metrics: Dict[str, Any],
+    kernel_exec_result: KernelExecResult,
+    metadata: Dict[str, Any],
+    anti_hack_ratio_min: float,
+    verbose: bool,
+) -> bool:
+    """Compute custom-kernel coverage from profiling metrics, attach metadata,
+    and apply Stage-2 ratio-based decoy detection.
+
+    Returns True if the kernel was marked decoy.
+    """
+    if profiling_metrics.get("profiling_warning"):
+        print(
+            f"[WARNING] Profiling warning: {profiling_metrics['profiling_warning']}"
+        )
+
+    if _profiling_empty(profiling_metrics):
+        print("[WARNING] Profiler returned empty results!")
+        print("[WARNING] This may be a profiler bug, not a decoy kernel issue.")
+        # No profiling data -> cannot make a ratio-based decoy decision.
+        # Conservatively treat as NOT decoy (zero-false-positive principle).
+        return False
+
+    metadata["profiling"] = profiling_metrics
+    if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+        kernel_exec_result.metadata["profiling"] = profiling_metrics
+
+    try:
+        coverage_result_dict = compute_cuda_kernel_coverage(
+            metadata.get("triton_profiler_matches", []), profiling_metrics
+        )
+    except Exception as coverage_error:
+        print(f"[ERROR] compute_cuda_kernel_coverage failed: {coverage_error}")
+        import traceback
+
+        traceback.print_exc()
+        coverage_result_dict = {
+            "num_custom_kernels": 0,
+            "num_total_kernels": 0,
+            "cuda_kernels_not_in_profiling": metadata.get(
+                "triton_profiler_matches", []
+            ),
+            "cuda_kernels_in_profiling": [],
+            "total_kernel_run_time_in_profiling_us": 0,
+            "anti_hack_total_kernel_run_time_in_profiling_us": 0,
+            "custom_kernel_cuda_time_in_profiling_us": 0,
+        }
+
+    num_custom_kernels = coverage_result_dict["num_custom_kernels"]
+    num_total_kernels = coverage_result_dict["num_total_kernels"]
+    cuda_kernels_not_in_profiling = coverage_result_dict[
+        "cuda_kernels_not_in_profiling"
+    ]
+    cuda_kernels_in_profiling = coverage_result_dict["cuda_kernels_in_profiling"]
+    total_kernel_run_time_in_profiling_us = coverage_result_dict[
+        "total_kernel_run_time_in_profiling_us"
+    ]
+    anti_hack_total_kernel_run_time_in_profiling_us = coverage_result_dict.get(
+        "anti_hack_total_kernel_run_time_in_profiling_us",
+        total_kernel_run_time_in_profiling_us,
+    )
+    anti_hack_num_total_kernels = coverage_result_dict.get(
+        "anti_hack_num_total_kernels",
+        num_total_kernels,
+    )
+    custom_kernel_cuda_time_in_profiling_us = coverage_result_dict[
+        "custom_kernel_cuda_time_in_profiling_us"
+    ]
+
+    metadata["num_custom_kernels"] = num_custom_kernels
+    metadata["num_total_kernels"] = num_total_kernels
+    ratio = num_custom_kernels / num_total_kernels if num_total_kernels > 0 else 0
+    metadata[
+        "triton_kernel_coverage"
+    ] = f"Run {num_custom_kernels} custom kernels / Total {num_total_kernels} kernels, Coverage: {ratio:.2%}"
+    metadata["triton_kernel_not_in_profiling"] = cuda_kernels_not_in_profiling
+    metadata["triton_kernel_in_profiling"] = cuda_kernels_in_profiling
+
+    metadata[
+        "total_kernel_run_time_in_profiling_us"
+    ] = total_kernel_run_time_in_profiling_us
+    metadata[
+        "anti_hack_total_kernel_run_time_in_profiling_us"
+    ] = anti_hack_total_kernel_run_time_in_profiling_us
+    metadata["anti_hack_num_total_kernels"] = anti_hack_num_total_kernels
+    metadata["memory_overhead_kernels_in_profiling"] = coverage_result_dict.get(
+        "memory_overhead_kernels_in_profiling",
+        [],
+    )
+    metadata[
+        "custom_kernel_cuda_time_in_profiling_us"
+    ] = custom_kernel_cuda_time_in_profiling_us
+    ratio_time = (
+        custom_kernel_cuda_time_in_profiling_us
+        / total_kernel_run_time_in_profiling_us
+        if total_kernel_run_time_in_profiling_us > 0
+        else 0
+    )
+    anti_hack_ratio_time = (
+        custom_kernel_cuda_time_in_profiling_us
+        / anti_hack_total_kernel_run_time_in_profiling_us
+        if anti_hack_total_kernel_run_time_in_profiling_us > 0
+        else 0
+    )
+    metadata[
+        "custom_kernel_cuda_time_coverage"
+    ] = (
+        f"Custom kernel CUDA time: {custom_kernel_cuda_time_in_profiling_us:.2f}us / Total time: {total_kernel_run_time_in_profiling_us:.2f}us, Coverage: {ratio_time:.2%}"
+    )
+
+    if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+        kernel_exec_result.metadata["num_custom_kernels"] = num_custom_kernels
+        kernel_exec_result.metadata["num_total_kernels"] = num_total_kernels
+        kernel_exec_result.metadata[
+            "triton_kernel_coverage"
+        ] = f"Run {num_custom_kernels} custom kernels / Total {num_total_kernels} kernels, Coverage: {ratio:.2%}"
+        kernel_exec_result.metadata["triton_profiler_matches"] = metadata.get(
+            "triton_profiler_matches", []
+        )
+
+        kernel_exec_result.metadata[
+            "custom_kernel_cuda_time_in_profiling_us"
+        ] = custom_kernel_cuda_time_in_profiling_us
+        kernel_exec_result.metadata[
+            "total_kernel_run_time_in_profiling_us"
+        ] = total_kernel_run_time_in_profiling_us
+        kernel_exec_result.metadata[
+            "anti_hack_total_kernel_run_time_in_profiling_us"
+        ] = anti_hack_total_kernel_run_time_in_profiling_us
+        kernel_exec_result.metadata[
+            "anti_hack_num_total_kernels"
+        ] = anti_hack_num_total_kernels
+        kernel_exec_result.metadata[
+            "memory_overhead_kernels_in_profiling"
+        ] = metadata["memory_overhead_kernels_in_profiling"]
+        kernel_exec_result.metadata[
+            "custom_kernel_cuda_time_coverage"
+        ] = (
+            f"Custom kernel CUDA time: {custom_kernel_cuda_time_in_profiling_us:.2f}us / Total time: {total_kernel_run_time_in_profiling_us:.2f}us, Coverage: {ratio_time:.2%}"
+        )
+
+    # Surface the time ratios on metadata (informational).
+    kernel_exec_result.metadata["custom_kernel_time_ratio"] = ratio_time
+    kernel_exec_result.metadata[
+        "custom_kernel_anti_hack_time_ratio"
+    ] = anti_hack_ratio_time
+    metadata["custom_kernel_time_ratio"] = ratio_time
+    metadata["custom_kernel_anti_hack_time_ratio"] = anti_hack_ratio_time
+
+    # ── Stage 2: ratio-based anti-hack decoy detection ──────────────────
+    # This function only runs when anti-hack is enabled, so the ratio check
+    # always applies here.
+    _already_decoy = (
+        kernel_exec_result
+        and kernel_exec_result.decoy_kernel
+        and kernel_exec_result.metadata.get("anti_hack_reason")
+    )
+
+    if num_total_kernels > 0:
+        if num_custom_kernels == 0:
+            print(
+                f"[WARNING] Profiler captured {num_total_kernels} kernels "
+                "but 0 custom kernels - marking as decoy "
+                "(reason=custom_kernel_not_executed)"
+            )
+            if not _already_decoy:
+                _mark_decoy(
+                    kernel_exec_result,
+                    metadata,
+                    reason="custom_kernel_not_executed",
+                    detection="profiling_custom_kernel_coverage",
+                )
+        elif anti_hack_ratio_time < anti_hack_ratio_min:
+            print(
+                f"[WARNING] Custom kernel anti-hack time ratio={anti_hack_ratio_time:.4f} "
+                f"< {anti_hack_ratio_min} - marking as decoy "
+                "(reason=custom_kernel_underused)"
+            )
+            if not _already_decoy:
+                _mark_decoy(
+                    kernel_exec_result,
+                    metadata,
+                    reason="custom_kernel_underused",
+                    detection="profiling_custom_kernel_time_ratio",
+                )
+        else:
+            print(
+                f"[INFO] Custom kernel anti-hack time ratio={anti_hack_ratio_time:.4f} "
+                f">= {anti_hack_ratio_min} — genuine kernel"
+            )
+    elif num_total_kernels == 0:
+        # Profiler captured nothing — likely a profiler bug, not a decoy.
+        # Conservatively do NOT mark decoy (zero-false-positive principle).
+        print(
+            "[WARNING] Profiler captured 0 total kernels - "
+            "likely profiler bug, NOT marking as decoy"
+        )
+
+    # Merge Stage 2 unmatched __global__ names into dead_code_kernels
+    # (cross-cutting hint: kernels declared but never observed at runtime).
+    _stage2_dead = [n for n in (cuda_kernels_not_in_profiling or [])]
+    if _stage2_dead:
+        _prev_dead = metadata.get("dead_code_kernels")
+        if isinstance(_prev_dead, list):
+            _merged_dead = list(_prev_dead) + [
+                n for n in _stage2_dead if n not in _prev_dead
+            ]
+        else:
+            _merged_dead = _stage2_dead
+        metadata["dead_code_kernels"] = _merged_dead
+        if kernel_exec_result and isinstance(kernel_exec_result.metadata, dict):
+            kernel_exec_result.metadata["dead_code_kernels"] = _merged_dead
+
+    return bool(kernel_exec_result.decoy_kernel)
 
 
 def _run_ncu_step(
@@ -637,13 +710,14 @@ def eval_kernel_against_ref(
     ),
     backend: str = "cuda",
     entry_point: str = "Model",
-    enable_profiling: bool = True,
-    enable_triton_detection: bool = True,
     backend_adapter: Optional[Any] = None,
     precompiled_artifact: Optional[Dict[str, Any]] = None,
     enable_ncu: bool = False,
     ncu_top_k_rules: int = 5,
     kernel_names: Optional[List[str]] = None,
+    enable_anti_hack: bool = True,
+    anti_hack_ratio_min: float = 0.50,
+    anti_hack_profiling_trials: int = 3,
 ) -> KernelExecResult:
     """Evaluate a custom kernel against a reference model.
 
@@ -672,6 +746,12 @@ def eval_kernel_against_ref(
         Explicit kernel-name list for the ``ncu -k 'regex:...'`` filter.
         When None, the function falls back to extracting names from
         ``custom_model_src`` via ``extract_global_kernel_names``.
+    enable_anti_hack : bool, default True
+        Enable two-stage decoy detection (AST early-exit + profiler ratio).
+    anti_hack_ratio_min : float, default 0.50
+        Custom-kernel time ratio below which a kernel is marked decoy (Stage 2).
+    anti_hack_profiling_trials : int, default 3
+        Number of light-profiling iterations for Stage 2 ratio check.
     """
     return _eval_kernel_against_ref_impl(
         original_model_src=original_model_src,
@@ -686,13 +766,14 @@ def eval_kernel_against_ref(
         device=device,
         backend=backend,
         entry_point=entry_point,
-        enable_profiling=enable_profiling,
-        enable_triton_detection=enable_triton_detection,
         backend_adapter=backend_adapter,
         precompiled_artifact=precompiled_artifact,
         enable_ncu=enable_ncu,
         ncu_top_k_rules=ncu_top_k_rules,
         kernel_names=kernel_names,
+        enable_anti_hack=enable_anti_hack,
+        anti_hack_ratio_min=anti_hack_ratio_min,
+        anti_hack_profiling_trials=anti_hack_profiling_trials,
     )
 
 
@@ -709,13 +790,14 @@ def _eval_kernel_against_ref_impl(
     device: Union[torch.device, int] = None,
     backend: str = "cuda",
     entry_point: str = "Model",
-    enable_profiling: bool = True,
-    enable_triton_detection: bool = True,
     backend_adapter: Optional[Any] = None,
     precompiled_artifact: Optional[Dict[str, Any]] = None,
     enable_ncu: bool = False,
     ncu_top_k_rules: int = 5,
     kernel_names: Optional[List[str]] = None,
+    enable_anti_hack: bool = True,
+    anti_hack_ratio_min: float = 0.50,
+    anti_hack_profiling_trials: int = 3,
 ) -> KernelExecResult:
     _total_phase_start = time.perf_counter()
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
@@ -1050,28 +1132,9 @@ def _eval_kernel_against_ref_impl(
         device,
     )
 
-    decoy_detected = _run_triton_detection_step(
-        enable_triton_detection=enable_triton_detection,
-        is_triton=is_triton,
-        kernel_exec_result=kernel_exec_result,
-        custom_model=custom_model,
-        get_inputs=get_inputs,
-        metadata=metadata,
-        seed_num=seed_num,
-        device=device,
-        verbose=verbose,
-        backend=backend,
-    )
-    if decoy_detected:
-        _record_memory_peak(metadata, device, kernel_exec_result)
-        with _timed(metadata, "cleanup"):
-            _cleanup()
-        _record_phase(metadata, "total", time.perf_counter() - _total_phase_start)
-        return kernel_exec_result
-
-    # For CUDA (non-Triton) backends, Triton detection won't find __global__
-    # kernel names. Extract them from source so the profiling coverage step
-    # can distinguish custom kernels from framework kernels.
+    # For CUDA backends, extract __global__ kernel names from source so the
+    # Stage-2 profiling coverage step can distinguish custom kernels from
+    # framework kernels.
     if not is_triton and not metadata.get("triton_profiler_matches"):
         from kernelgym.toolkit.kernel_names import extract_global_kernel_names
         cuda_names = extract_global_kernel_names(custom_model_src)
@@ -1080,6 +1143,133 @@ def _eval_kernel_against_ref_impl(
             if verbose:
                 print(f"[Eval] CUDA kernel names from source: {cuda_names}")
 
+    def _finalize_decoy() -> None:
+        """Decoy kernels skip performance + NCU. Stamp the skip contract so the
+        outer response conversion yields kernel_runtime=-1.0 / speedup=0.0.
+        """
+        kernel_exec_result.runtime = -1.0
+        kernel_exec_result.metadata["performance_skipped"] = True
+        kernel_exec_result.metadata["performance_skipped_reason"] = "decoy_kernel"
+        _record_memory_peak(metadata, device, kernel_exec_result)
+        with _timed(metadata, "cleanup"):
+            _cleanup()
+        _record_phase(metadata, "total", time.perf_counter() - _total_phase_start)
+
+    # ── Stage 1: static anti-hack (AST + CUDA launch, zero GPU cost) ─────
+    # Conservative by design: only fires on definitive evidence; anything
+    # ambiguous (opaque dispatch / any launch marker / macros) is deferred to
+    # Stage 2. A Stage-1 decoy is TERMINAL — skip dynamic anti-hack, perf, NCU.
+    if enable_anti_hack and kernel_exec_result and kernel_exec_result.correctness:
+        try:
+            from kernelgym.toolkit.exposed_ops import (
+                extract_exposed_op_names,
+                analyze_forward_calls,
+            )
+            exposed = extract_exposed_op_names(custom_model_src)
+            if exposed:
+                report = analyze_forward_calls(custom_model_src, exposed)
+                # Only report dead_code_kernels when analysis is definitive
+                # (no opaque dispatch).  Opaque patterns (alias / getattr / …)
+                # may hide real call-sites, so labelling any op as "dead"
+                # would be unreliable.
+                if report.uncalled_exposed and not report.has_opaque_dispatch:
+                    kernel_exec_result.metadata["dead_code_kernels"] = report.uncalled_exposed
+                    metadata["dead_code_kernels"] = report.uncalled_exposed
+                    if verbose:
+                        print(
+                            f"[AntiHack] Stage 1 dead_code_kernels: {report.uncalled_exposed}"
+                        )
+                # Early exit: exposed non-empty AND zero call-sites AND no opaque dispatch
+                if exposed and not report.called_exposed and not report.has_opaque_dispatch:
+                    _mark_decoy(
+                        kernel_exec_result,
+                        metadata,
+                        reason="custom_operator_not_called",
+                        detection="source_forward_call_analysis",
+                    )
+                    if verbose:
+                        print(
+                            "[AntiHack] Stage 1 marked decoy "
+                            "(reason=custom_operator_not_called) — "
+                            f"exposed={exposed}, called={report.called_exposed}, "
+                            f"opaque={report.has_opaque_dispatch}"
+                        )
+                elif report.has_opaque_dispatch and verbose:
+                    print(
+                        "[AntiHack] Stage 1: has_opaque_dispatch=True — "
+                        "falling back to Stage 2 profiler"
+                    )
+            elif verbose:
+                print("[AntiHack] Stage 1: no exposed op names — skip")
+
+            # ── Stage 1b: CUDA __global__ kernel launch-site check ──────────
+            # Detect decoys that call the exposed host op in forward but
+            # never actually launch any __global__ kernel (e.g. the host
+            # function uses cuBLAS/cuDNN instead of the declared kernel).
+            #
+            # This source-only pass is intentionally conservative: it only
+            # marks a decoy when there is no launch marker anywhere in the
+            # source and the declared kernel names have no extra references.
+            # Anything ambiguous is left to Stage 2 profiling.
+            if (not kernel_exec_result.decoy_kernel
+                    and not is_triton
+                    and custom_model_src):
+                try:
+                    from kernelgym.toolkit.kernel_names import (
+                        find_uncalled_cuda_kernels,
+                        extract_global_kernel_names,
+                    )
+                    all_kernels = extract_global_kernel_names(custom_model_src)
+                    if all_kernels:
+                        uncalled_cuda = find_uncalled_cuda_kernels(custom_model_src)
+                        if set(uncalled_cuda) == set(all_kernels):
+                            _mark_decoy(
+                                kernel_exec_result,
+                                metadata,
+                                reason="cuda_kernel_not_launched",
+                                detection="source_cuda_launch_analysis",
+                            )
+                            if verbose:
+                                print(
+                                    "[AntiHack] Stage 1 marked decoy "
+                                    "(reason=cuda_kernel_not_launched) — "
+                                    f"uncalled CUDA kernels: {uncalled_cuda}"
+                                )
+                except Exception as e:
+                    if verbose:
+                        print(
+                            "[AntiHack] Stage 1 CUDA kernel check failed "
+                            f"(conservative no-op): {e}"
+                        )
+        except Exception as e:
+            if verbose:
+                print(f"[AntiHack] Stage 1 AST analysis failed (conservative no-op): {e}")
+
+        # Stage 1 decoy is terminal: skip dynamic anti-hack, performance, NCU.
+        if kernel_exec_result.decoy_kernel:
+            _finalize_decoy()
+            return kernel_exec_result
+
+    # ── Stage 2: dynamic profiling anti-hack (runs BEFORE performance) ───
+    # Decoupled light profiling pass + custom-kernel coverage ratio. A Stage-2
+    # decoy is also terminal — skip performance + NCU.
+    if enable_anti_hack and kernel_exec_result and kernel_exec_result.correctness:
+        is_decoy = _run_dynamic_anti_hack_step(
+            kernel_exec_result=kernel_exec_result,
+            custom_model=custom_model,
+            get_inputs=get_inputs,
+            metadata=metadata,
+            verbose=verbose,
+            seed_num=seed_num,
+            device=device,
+            anti_hack_trials=anti_hack_profiling_trials,
+            anti_hack_ratio_min=anti_hack_ratio_min,
+        )
+        if is_decoy:
+            _finalize_decoy()
+            return kernel_exec_result
+
+    # ── Performance: pure CUDA-event timing (no profiling) ───────────────
     if measure_performance:
         _run_performance_step(
             kernel_exec_result=kernel_exec_result,
@@ -1091,13 +1281,17 @@ def _eval_kernel_against_ref_impl(
             verbose=verbose,
             seed_num=seed_num,
             device=device,
-            enable_profiling=enable_profiling,
         )
 
     # NCU profiling — runs in a fresh subprocess so it can't pollute
     # ``performance.measure`` timings. Strictly opt-in: only when
-    # ``enable_ncu`` is True AND correctness passed.
-    if enable_ncu and kernel_exec_result and kernel_exec_result.correctness:
+    # ``enable_ncu`` is True, correctness passed, AND the kernel is not a decoy.
+    if (
+        enable_ncu
+        and kernel_exec_result
+        and kernel_exec_result.correctness
+        and not kernel_exec_result.decoy_kernel
+    ):
         # Build an artifact dict the harness can feed to backend.load().
         # Prefer the compile-server artifact (which carries build_dir and
         # code); fall back to the in-process compile path.

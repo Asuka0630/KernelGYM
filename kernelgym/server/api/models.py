@@ -124,6 +124,25 @@ class EvaluationRequest(BaseModel):
         description="Number of Top-K NCU rule suggestions to keep, sorted by "
                     "estimated speedup. Ignored when enable_ncu is False.",
     )
+    # Anti-hack decoy detection — per-request control (Option B).
+    enable_anti_hack: Optional[bool] = Field(
+        default=True,
+        description="Enable two-stage decoy detection: AST early-exit (Stage 1) + "
+                    "lightweight profiler ratio (Stage 2).  Set to False to skip "
+                    "anti-hack entirely for this request.",
+    )
+    anti_hack_ratio_min: Optional[float] = Field(
+        default=0.50,
+        ge=0.0, le=1.0,
+        description="Custom-kernel time ratio below which the kernel is marked "
+                    "decoy in Stage 2 (default 0.50 = 50%).",
+    )
+    anti_hack_profiling_trials: Optional[int] = Field(
+        default=3,
+        ge=1, le=20,
+        description="Number of light-profiling forward iterations for the "
+                    "Stage 2 ratio check (default 3).",
+    )
     kernel_names: Optional[List[str]] = Field(
         default=None,
         description="Explicit list of __global__ kernel names to profile with "

@@ -42,6 +42,9 @@ def time_execution_with_cuda_event(
     device: torch.device = None,
     enable_profiling: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
+    enable_anti_hack: bool = False,
+    anti_hack_trials: int = 3,
+    skip_profiling_anti_hack: bool = False,
 ) -> Tuple[List[float], Dict[str, Any]]:
     if device is None:
         if verbose:
@@ -77,17 +80,35 @@ def time_execution_with_cuda_event(
     _record_phase_ms(metadata, "performance.measure.timing_trials", time.perf_counter() - _trials_start)
 
     profiling_metrics: Dict[str, Any] = {}
-    if enable_profiling:
+
+    # Decide whether to run profiling.  Two triggers:
+    #   1. enable_profiling           — full diagnostic (legacy behaviour).
+    #   2. enable_anti_hack           — lightweight ratio check (Stage 2).
+    # When Stage 1 already ruled decoy (skip_profiling_anti_hack), bail out.
+    _should_profile = enable_profiling or (enable_anti_hack and not skip_profiling_anti_hack)
+
+    if _should_profile:
         _prof_start = time.perf_counter()
         try:
             torch.cuda.synchronize(device=device)
 
-            num_profiling_trials = min(10, num_trials)
+            if enable_profiling:
+                # Full diagnostic: up to 10 trials, heavy config
+                num_profiling_trials = min(10, num_trials)
+                _light = False
+                _tag = "full"
+            else:
+                # Anti-hack only: configurable trials (default 3), light config
+                num_profiling_trials = anti_hack_trials
+                _light = True
+                _tag = "light (anti-hack)"
+
             print(
-                f"[Profiling] Running {num_profiling_trials} additional iterations for profiling..."
+                f"[Profiling] Running {num_profiling_trials} additional "
+                f"iterations for profiling ({_tag})..."
             )
 
-            with profiling_context(True) as prof:
+            with profiling_context(True, light=_light) as prof:
                 for _ in range(num_profiling_trials):
                     kernel_fn(*args)
                 torch.cuda.synchronize(device=device)
@@ -110,6 +131,56 @@ def time_execution_with_cuda_event(
             )
 
     return elapsed_times, profiling_metrics
+
+
+def run_anti_hack_profiling(
+    kernel_fn: callable,
+    *args,
+    num_trials: int = 3,
+    verbose: bool = False,
+    device: torch.device = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dedicated *light* profiling pass for Stage-2 anti-hack coverage.
+
+    Mirrors the light-profiling branch of ``time_execution_with_cuda_event``
+    but runs **no timing trials** — it exists purely to collect kernel-level
+    profiling metrics (custom-kernel coverage / CUDA-time ratio) *before* the
+    performance timing step, so that timing and profiling are fully decoupled.
+
+    Returns the extracted profiling metrics dict (possibly empty / with a
+    ``profiling_error`` key on failure). Phase wall-time is accumulated under
+    ``metadata['phase_timings_ms']['anti_hack.profiling_inline']``.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+
+    profiling_metrics: Dict[str, Any] = {}
+    _prof_start = time.perf_counter()
+    try:
+        torch.cuda.synchronize(device=device)
+        print(
+            f"[Profiling] Running {num_trials} iterations for anti-hack "
+            f"profiling (light)..."
+        )
+        with profiling_context(True, light=True) as prof:
+            for _ in range(num_trials):
+                kernel_fn(*args)
+            torch.cuda.synchronize(device=device)
+        profiling_metrics = extract_profiling_metrics(prof)
+        if profiling_metrics:
+            print(
+                f"[Profiling] Captured {profiling_metrics.get('kernel_count', 0)} CUDA kernels"
+            )
+    except Exception as e:
+        print(f"[Profiling] Warning: anti-hack profiling failed: {e}")
+        profiling_metrics = {"profiling_error": str(e)}
+    finally:
+        _record_phase_ms(
+            metadata, "anti_hack.profiling_inline", time.perf_counter() - _prof_start
+        )
+
+    return profiling_metrics
 
 
 def run_profiling_only(

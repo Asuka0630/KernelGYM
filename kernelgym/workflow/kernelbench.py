@@ -85,25 +85,14 @@ class KernelBenchWorkflowController(WorkflowController):
         run_correctness = eval_task.run_correctness
         if run_correctness is None:
             run_correctness = True
-        run_triton_detection = eval_task.run_triton_detection
-        if run_triton_detection is None:
-            run_triton_detection = eval_task.enable_triton_detection
-        if run_triton_detection is None:
-            run_triton_detection = eval_task.backend == "triton"
         run_performance = eval_task.run_performance
         if run_performance is None:
             run_performance = eval_task.measure_performance
         if run_performance is None:
             run_performance = True
         kernel_payload["run_correctness"] = run_correctness
-        kernel_payload["run_triton_detection"] = run_triton_detection
         kernel_payload["run_performance"] = run_performance
-        kernel_payload["enable_triton_detection"] = run_triton_detection
         kernel_payload["measure_performance"] = run_performance
-        enable_profiling = eval_task.enable_profiling
-        if enable_profiling is None:
-            enable_profiling = settings.enable_profiling
-        kernel_payload["enable_profiling"] = enable_profiling
 
         # NCU profiling — strictly per-request opt-in.
         kernel_payload["enable_ncu"] = bool(eval_task.enable_ncu)
@@ -114,6 +103,17 @@ class KernelBenchWorkflowController(WorkflowController):
         )
         if eval_task.kernel_names is not None:
             kernel_payload["kernel_names"] = list(eval_task.kernel_names)
+
+        # Anti-hack decoy detection — per-request control (already in
+        # KernelEvaluationTask via _create_paired_tasks, but resolve None
+        # defaults explicitly so the worker payload is self-contained).
+        if eval_task.enable_anti_hack is not None:
+            kernel_payload["enable_anti_hack"] = bool(eval_task.enable_anti_hack)
+        if eval_task.anti_hack_ratio_min is not None:
+            kernel_payload["anti_hack_ratio_min"] = float(eval_task.anti_hack_ratio_min)
+        if eval_task.anti_hack_profiling_trials is not None:
+            kernel_payload["anti_hack_profiling_trials"] = int(eval_task.anti_hack_profiling_trials)
+
         kernel_task_spec = TaskSpec(
             kind="kernelbench.kernel",
             payload=kernel_payload,
