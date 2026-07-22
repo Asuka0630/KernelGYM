@@ -1,3 +1,0 @@
-[submodule "drkernel/verl"]
-	path = drkernel/verl
-	url = https://github.com/verl-project/verl.git
